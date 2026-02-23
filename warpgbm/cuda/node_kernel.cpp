@@ -14,16 +14,11 @@ void launch_directional_split_kernel(
     int threads = 128);
 
 void launch_histogram_kernel_cuda_configurable(
-    const at::Tensor &bin_indices,
-    const at::Tensor &residuals,
-    const at::Tensor &sample_indices,
-    const at::Tensor &feature_indices,
-    const at::Tensor &era_indices,
-    at::Tensor &grad_hist,
-    at::Tensor &hess_hist,
-    int num_bins,
-    int threads_per_block = 256,
-    int rows_per_thread = 1);
+    const at::Tensor &bin_indices, const at::Tensor &grads,
+    const at::Tensor &hess, const at::Tensor &sample_indices,
+    const at::Tensor &feature_indices, const at::Tensor &era_indices,
+    at::Tensor &grad_hist, at::Tensor &hess_hist, int num_bins,
+    int threads_per_block = 256, int rows_per_thread = 1);
 
 void launch_bin_column_kernel(
     at::Tensor X,

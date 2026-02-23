@@ -368,8 +368,10 @@ model.fit(
     X,                              # Features: np.array shape (n_samples, n_features)
     y,                              # Target: np.array shape (n_samples,)
     era_id=None,                    # Optional: era labels for invariant learning
+    sample_weight=None,             # Optional: per-sample training weights (strictly positive, auto-rescaled to mean=1)
     X_eval=None,                    # Optional: validation features
-    y_eval=None,                    # Optional: validation targets  
+    y_eval=None,                    # Optional: validation targets
+    sample_weight_eval=None,        # Optional: per-sample eval weights (strictly positive, auto-rescaled to mean=1)
     eval_every_n_trees=None,        # Eval frequency (in rounds)
     early_stopping_rounds=None,     # Stop if no improvement for N evals
     eval_metric='mse'               # 'mse', 'rmsle', 'corr', 'logloss', 'accuracy'

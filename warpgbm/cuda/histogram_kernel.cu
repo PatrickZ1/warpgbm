@@ -3,13 +3,14 @@
 #include <torch/extension.h>
 
 __global__ void histogram_tiled_configurable_kernel(
-    const int8_t *__restrict__ bin_indices, // [N, F_master]
-    const float *__restrict__ residuals,    // [N]
-    const int32_t *__restrict__ sample_indices, // [N]
+    const int8_t *__restrict__ bin_indices,      // [N, F_master]
+    const float *__restrict__ grads,             // [N]
+    const float *__restrict__ hess,              // [N]
+    const int32_t *__restrict__ sample_indices,  // [N]
     const int32_t *__restrict__ feature_indices, // [F]
-    const int32_t *__restrict__ era_indices, // [N]
-    float *__restrict__ grad_hist,          // [F * B]
-    float *__restrict__ hess_hist,          // [F * B]
+    const int32_t *__restrict__ era_indices,     // [N]
+    float *__restrict__ grad_hist,               // [F * B]
+    float *__restrict__ hess_hist,               // [F * B]
     int64_t N, int64_t F_master, int64_t F, int64_t B, int64_t num_eras,
     int rows_per_thread)
 {
@@ -40,8 +41,8 @@ __global__ void histogram_tiled_configurable_kernel(
             int32_t era = era_indices[sample];
             if (bin >= 0 && bin < B)
             {
-                atomicAdd(&sh_grad[era * B + bin], residuals[sample]);
-                atomicAdd(&sh_hess[era * B + bin], 1.0f);
+                atomicAdd(&sh_grad[era * B + bin], grads[sample]);
+                atomicAdd(&sh_hess[era * B + bin], hess[sample]);
             }
         }
     }
@@ -62,7 +63,8 @@ __global__ void histogram_tiled_configurable_kernel(
 
 void launch_histogram_kernel_cuda_configurable(
     const at::Tensor &bin_indices,
-    const at::Tensor &residuals,
+    const at::Tensor &grads,
+    const at::Tensor &hess,
     const at::Tensor &sample_indices,
     const at::Tensor &feature_indices,
     const at::Tensor &era_indices,
@@ -87,7 +89,8 @@ void launch_histogram_kernel_cuda_configurable(
 
     histogram_tiled_configurable_kernel<<<blocks, threads, shared_mem_bytes>>>(
         bin_indices.data_ptr<int8_t>(),
-        residuals.data_ptr<float>(),
+        grads.data_ptr<float>(),
+        hess.data_ptr<float>(),
         sample_indices.data_ptr<int32_t>(),
         feature_indices.data_ptr<int32_t>(),
         era_indices.data_ptr<int32_t>(),
