@@ -865,7 +865,7 @@ pytest tests/test_fit_predict_corr.py -v
 - [ ] ONNX export for deployment
 
 **Medium Priority**:
-- [ ] Monotonic constraints
+- [x] Monotonic constraints
 - [ ] Feature interaction constraints
 - [ ] Custom loss functions (user-defined gradients)
 - [ ] Learning rate scheduling

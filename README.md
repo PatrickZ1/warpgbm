@@ -197,6 +197,36 @@ model.fit(
 # Now your model ignores spurious correlations that don't generalize!
 ```
 
+### Monotonic Constraints
+
+Constrain model behavior per feature using `1, 0, -1`:
+
+- `1`: prediction is monotonic increasing w.r.t. that feature
+- `0`: no constraint
+- `-1`: prediction is monotonic decreasing
+
+You can pass constraints as either a dense vector (`len == n_features`) or sparse index dict.
+
+```python
+# Dense vector form
+model = WarpGBM(
+    objective='regression',
+    monotonic_constraints=[1, 0, -1, 0],
+)
+
+# Sparse dict form
+model = WarpGBM(
+    objective='regression',
+    monotonic_constraints={0: 1, 2: -1},
+)
+
+# With eras: constraints are enforced per era during split selection
+model.fit(X, y, era_id=era_labels)
+
+# Without eras: constraints are enforced globally
+model.fit(X, y)
+```
+
 ### Feature Importance: Understand Your Model
 
 ```python
@@ -355,6 +385,7 @@ WarpGBM(
     colsample_bytree=1.0,          # Feature subsample ratio per tree
     random_state=None,             # Random seed for reproducibility
     warm_start=False,              # If True, continue training from existing trees
+    monotonic_constraints=None,    # Optional: vector or dict {feature_idx: -1|0|1}
     threads_per_block=64,          # CUDA block size (tune for your GPU)
     rows_per_thread=4,             # Rows processed per thread
     device='cuda'                  # 'cuda' or 'cpu' (GPU strongly recommended)
@@ -460,7 +491,7 @@ pip install dist/warpgbm-*.whl
 - [ ] Multi-GPU training support
 - [ ] SHAP value computation on GPU
 - [ ] Feature interaction constraints
-- [ ] Monotonic constraints
+- [x] Monotonic constraints
 - [ ] Custom loss functions
 - [ ] Distributed training
 - [ ] ONNX export for deployment

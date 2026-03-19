@@ -53,6 +53,7 @@ def _get_node_kernel():
 
 
 class WarpGBM(BaseEstimator, RegressorMixin):
+
     def __init__(
         self,
         objective="regression",
@@ -69,6 +70,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         colsample_bytree=1.0,
         random_state=None,
         warm_start=False,
+        monotonic_constraints=None,
     ):
         # Validate arguments
         self._validate_hyperparams(
@@ -83,6 +85,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             rows_per_thread=rows_per_thread,
             L2_reg=L2_reg,
             colsample_bytree=colsample_bytree,
+            monotonic_constraints=monotonic_constraints,
         )
 
         self.objective = objective
@@ -115,9 +118,14 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.colsample_bytree = colsample_bytree
         self.random_state = random_state
         self.warm_start = warm_start
+        self.monotonic_constraints = monotonic_constraints
         self.label_encoder = None
         self.feature_importance_ = None
         self.per_era_feature_importance_ = None
+        self.monotonic_constraints_vector_ = None
+        self.monotonic_required_split_direction_ = None
+        self.monotonic_required_split_direction_gpu_ = None
+        self._monotonic_constraints_fitted_ = False
         self._is_fitted = False
         self._trees_trained = 0  # Track number of trees already trained
 
@@ -182,6 +190,69 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             raise ValueError(
                 f"Invalid colsample_bytree: {kwargs['colsample_bytree']}. Must be a float value > 0 and <= 1."
             )
+
+        mc = kwargs.get("monotonic_constraints")
+        if mc is not None and not isinstance(mc, (list, tuple, np.ndarray, dict)):
+            raise TypeError(
+                "monotonic_constraints must be None, a vector-like object, or a dict {feature_idx: -1|0|1}."
+            )
+
+    def _normalize_monotonic_constraints(self, n_features):
+        constraints = self.monotonic_constraints
+
+        if constraints is None:
+            return np.zeros(n_features, dtype=np.int8)
+
+        if isinstance(constraints, dict):
+            dense = np.zeros(n_features, dtype=np.int8)
+            for key, value in constraints.items():
+                if isinstance(key, bool) or not isinstance(key, (int, np.integer)):
+                    raise TypeError(
+                        "monotonic_constraints dict keys must be integer feature indices."
+                    )
+                if key < 0 or key >= n_features:
+                    raise ValueError(
+                        f"monotonic_constraints key {key} out of range for {n_features} features."
+                    )
+                if value not in (-1, 0, 1):
+                    raise ValueError(
+                        "monotonic_constraints values must be one of {-1, 0, 1}."
+                    )
+                dense[int(key)] = int(value)
+            return dense
+
+        dense = np.asarray(constraints, dtype=np.int8)
+        if dense.ndim != 1:
+            raise ValueError(
+                f"monotonic_constraints vector must be 1-dimensional, got shape {dense.shape}."
+            )
+        if dense.shape[0] != n_features:
+            raise ValueError(
+                f"monotonic_constraints vector length must equal n_features ({n_features}), got {dense.shape[0]}."
+            )
+        if not np.isin(dense, [-1, 0, 1]).all():
+            raise ValueError("monotonic_constraints values must be one of {-1, 0, 1}.")
+        return dense.astype(np.int8, copy=False)
+
+    def _prepare_monotonic_constraints(self, n_features):
+        dense = self._normalize_monotonic_constraints(n_features)
+
+        if self.warm_start and self._is_fitted and self._monotonic_constraints_fitted_:
+            if not np.array_equal(dense, self.monotonic_constraints_vector_):
+                raise ValueError(
+                    "monotonic_constraints must match the fitted model when warm_start=True."
+                )
+
+        self.monotonic_constraints_vector_ = dense
+        # Split direction convention: +1 means left leaf > right leaf.
+        # For monotonic increasing features, right should be >= left, hence required split dir = -1.
+        self.monotonic_required_split_direction_ = -dense
+        self.monotonic_required_split_direction_gpu_ = (
+            torch.from_numpy(self.monotonic_required_split_direction_)
+            .to(torch.int8)
+            .to(self.device)
+        )
+        self._monotonic_constraints_fitted_ = True
 
     def _compute_tree_predictions(self, tree, bin_indices):
         """
@@ -457,6 +528,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         if era_id is None:
             era_id = np.ones(X.shape[0], dtype="int32")
+
+        self._prepare_monotonic_constraints(X.shape[1])
 
         # ─── Handle multiclass vs regression ───
         if self.objective == "multiclass" or self.objective == "binary":
@@ -760,6 +833,29 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             directional_agreement = self.per_era_direction.mean(dim=0).abs()  # [F, B-1]
             era_splitting_criterion = self.per_era_gain.mean(dim=0)  # [F, B-1]
             dir_score_mask = ( directional_agreement == directional_agreement.max() ) & (era_splitting_criterion > self.min_split_gain)
+
+        if self.monotonic_required_split_direction_gpu_ is not None:
+            local_required_dirs = self.monotonic_required_split_direction_gpu_[
+                self.feat_indices_tree.to(torch.long)
+            ]
+            constrained_rows = local_required_dirs != 0
+
+            if constrained_rows.any():
+                row_mask = constrained_rows.view(-1, 1)
+                required = local_required_dirs.to(self.per_era_direction.dtype).view(
+                    -1, 1
+                )
+
+                if self.num_eras == 1:
+                    local_dirs = self.per_era_direction[0, :, :]
+                    monotonic_mask = (~row_mask) | (local_dirs == required)
+                else:
+                    all_era_matches = (
+                        self.per_era_direction == required.unsqueeze(0)
+                    ).all(dim=0)
+                    monotonic_mask = (~row_mask) | all_era_matches
+
+                dir_score_mask = dir_score_mask & monotonic_mask
 
         if not dir_score_mask.any():
             return -1, -1
@@ -1344,32 +1440,37 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         # Collect all the necessary state to save
         state = {
             # Hyperparameters
-            'objective': self.objective,
-            'num_bins': self.num_bins,
-            'max_depth': self.max_depth,
-            'learning_rate': self.learning_rate,
-            'n_estimators': self.n_estimators,
-            'min_child_weight': self.min_child_weight,
-            'min_split_gain': self.min_split_gain,
-            'L2_reg': self.L2_reg,
-            'colsample_bytree': self.colsample_bytree,
-            'random_state': self.random_state,
-            'warm_start': self.warm_start,
-            
+            "objective": self.objective,
+            "num_bins": self.num_bins,
+            "max_depth": self.max_depth,
+            "learning_rate": self.learning_rate,
+            "n_estimators": self.n_estimators,
+            "min_child_weight": self.min_child_weight,
+            "min_split_gain": self.min_split_gain,
+            "L2_reg": self.L2_reg,
+            "colsample_bytree": self.colsample_bytree,
+            "random_state": self.random_state,
+            "warm_start": self.warm_start,
+            "monotonic_constraints": self.monotonic_constraints,
             # Trained state
-            'forest': self.forest,
-            'bin_edges': self.bin_edges,
-            'base_prediction': self.base_prediction,
-            'num_features': self.num_features,
-            'num_classes': self.num_classes,
-            'classes_': self.classes_,
-            'label_encoder': self.label_encoder,
-            'feature_importance_': self.feature_importance_,
-            'per_era_feature_importance_': self.per_era_feature_importance_,
-            '_is_fitted': self._is_fitted,
-            '_trees_trained': self._trees_trained,
-            'training_loss': self.training_loss if hasattr(self, 'training_loss') else [],
-            'eval_loss': self.eval_loss if hasattr(self, 'eval_loss') else [],
+            "forest": self.forest,
+            "bin_edges": self.bin_edges,
+            "base_prediction": self.base_prediction,
+            "num_features": self.num_features,
+            "num_classes": self.num_classes,
+            "classes_": self.classes_,
+            "label_encoder": self.label_encoder,
+            "feature_importance_": self.feature_importance_,
+            "per_era_feature_importance_": self.per_era_feature_importance_,
+            "_is_fitted": self._is_fitted,
+            "_trees_trained": self._trees_trained,
+            "training_loss": (
+                self.training_loss if hasattr(self, "training_loss") else []
+            ),
+            "eval_loss": self.eval_loss if hasattr(self, "eval_loss") else [],
+            "monotonic_constraints_vector_": self.monotonic_constraints_vector_,
+            "monotonic_required_split_direction_": self.monotonic_required_split_direction_,
+            "_monotonic_constraints_fitted_": self._monotonic_constraints_fitted_,
         }
 
         with open(path, 'wb') as f:
@@ -1415,6 +1516,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.colsample_bytree = state['colsample_bytree']
         self.random_state = state['random_state']
         self.warm_start = state['warm_start']
+        self.monotonic_constraints = state.get("monotonic_constraints", None)
 
         # Restore trained state
         self.forest = state['forest']
@@ -1430,6 +1532,17 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._trees_trained = state['_trees_trained']
         self.training_loss = state.get('training_loss', [])
         self.eval_loss = state.get('eval_loss', [])
+        self.monotonic_constraints_vector_ = state.get(
+            "monotonic_constraints_vector_", None
+        )
+        self.monotonic_required_split_direction_ = state.get(
+            "monotonic_required_split_direction_", None
+        )
+        self._monotonic_constraints_fitted_ = state.get(
+            "_monotonic_constraints_fitted_",
+            self.monotonic_constraints_vector_ is not None,
+        )
+        self.monotonic_required_split_direction_gpu_ = None
 
         print(f"Model loaded from {path} ({self._trees_trained} trees)")
 
