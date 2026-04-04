@@ -12,6 +12,7 @@ from warpgbm.metrics import (
     log_loss_torch,
     accuracy_torch,
     weighted_mse_torch,
+    weighted_multi_mse_torch,
     weighted_rmsle_torch,
     weighted_log_loss_torch,
     weighted_accuracy_torch,
@@ -100,13 +101,18 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.unique_eras = None
         self.device = device
         self.num_classes = None
+        self.num_outputs = None
         self.classes_ = None
         self.root_gradient_histogram = None
         self.root_hessian_histogram = None
         self.gradients = None
+        self.grad_split = None
+        self.hess_split = None
         self.root_node_indices = None
         self.bin_indices = None
         self.Y_gpu = None
+        self.valid_target_mask_gpu = None
+        self.valid_target_mask_eval_gpu = None
         self.num_features = None
         self.num_samples = None
         self.min_child_weight = min_child_weight
@@ -130,17 +136,25 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._is_fitted = False
         self._trees_trained = 0  # Track number of trees already trained
         self._cached_regression_tree_tensor = None
+        self._cached_multi_regression_tree_tensors = None
         self._cached_multiclass_tree_tensors = None
         self._cached_tree_device = None
         self._cached_tree_max_nodes = None
         self._cached_tree_objective = None
         self._cached_tree_rounds = None
+        self._cached_tree_num_outputs = None
 
     def _validate_hyperparams(self, **kwargs):
         # Validate objective
-        if kwargs["objective"] not in ["regression", "multiclass", "binary"]:
+        if kwargs["objective"] not in [
+            "regression",
+            "multi_regression",
+            "multiclass",
+            "binary",
+        ]:
             raise ValueError(
-                f"objective must be 'regression', 'binary', or 'multiclass', got {kwargs['objective']}."
+                "objective must be 'regression', 'multi_regression', 'binary', "
+                f"or 'multiclass', got {kwargs['objective']}."
             )
 
         # Type checks
@@ -273,13 +287,33 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             torch.Tensor: Predictions for each sample
         """
         num_samples = bin_indices.size(0)
-        predictions = torch.zeros(num_samples, device=self.device, dtype=torch.float32)
+        is_multi_output = self.objective == "multi_regression"
+        if is_multi_output:
+            predictions = torch.zeros(
+                (num_samples, self.num_outputs),
+                device=self.device,
+                dtype=torch.float32,
+            )
+        else:
+            predictions = torch.zeros(
+                num_samples,
+                device=self.device,
+                dtype=torch.float32,
+            )
 
         def traverse(node, sample_mask):
             """Recursively traverse tree and assign leaf values."""
             if "leaf_value" in node:
                 # Leaf node: assign value to all samples in this leaf
-                predictions[sample_mask] = node["leaf_value"] * self.learning_rate
+                if is_multi_output:
+                    leaf_values = torch.as_tensor(
+                        node["leaf_value"],
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    predictions[sample_mask, :] = leaf_values * self.learning_rate
+                else:
+                    predictions[sample_mask] = node["leaf_value"] * self.learning_rate
             else:
                 # Split node: route samples left or right
                 feature_idx = node["feature"]
@@ -345,13 +379,25 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         sample_weight,
         sample_weight_eval,
     ):
+        is_multi_regression = self.objective == "multi_regression"
+
         # ─── Required: X and y ───
         if not isinstance(X, np.ndarray) or not isinstance(y, np.ndarray):
             raise TypeError("X and y must be numpy arrays.")
         if X.ndim != 2:
             raise ValueError(f"X must be 2-dimensional, got shape {X.shape}")
-        if y.ndim != 1:
-            raise ValueError(f"y must be 1-dimensional, got shape {y.shape}")
+
+        if is_multi_regression:
+            if y.ndim != 2:
+                raise ValueError(
+                    f"y must be 2-dimensional for objective='multi_regression', got shape {y.shape}"
+                )
+            if y.shape[1] < 1:
+                raise ValueError("y must contain at least one output column.")
+        else:
+            if y.ndim != 1:
+                raise ValueError(f"y must be 1-dimensional, got shape {y.shape}")
+
         if X.shape[0] != y.shape[0]:
             raise ValueError(
                 f"X and y must have the same number of rows. Got {X.shape[0]} and {y.shape[0]}."
@@ -361,18 +407,35 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         if sample_weight is not None:
             if not isinstance(sample_weight, np.ndarray):
                 raise TypeError("sample_weight must be a numpy array.")
-            if sample_weight.ndim != 1:
-                raise ValueError(
-                    f"sample_weight must be 1-dimensional, got shape {sample_weight.shape}"
+
+            if is_multi_regression:
+                self._validate_multi_output_weight_shape(
+                    sample_weight,
+                    y.shape,
+                    "sample_weight",
                 )
-            if len(sample_weight) != len(y):
-                raise ValueError(
-                    f"sample_weight must have same length as y. Got {len(sample_weight)} and {len(y)}."
-                )
+            else:
+                if sample_weight.ndim != 1:
+                    raise ValueError(
+                        f"sample_weight must be 1-dimensional, got shape {sample_weight.shape}"
+                    )
+                if len(sample_weight) != len(y):
+                    raise ValueError(
+                        f"sample_weight must have same length as y. Got {len(sample_weight)} and {len(y)}."
+                    )
+
             if not np.all(np.isfinite(sample_weight)):
                 raise ValueError("sample_weight must contain only finite values.")
-            if not np.all(sample_weight > 0):
-                raise ValueError("sample_weight must be strictly positive.")
+            if is_multi_regression:
+                if not np.all(sample_weight >= 0):
+                    raise ValueError("sample_weight must be non-negative.")
+                if not np.any(sample_weight > 0):
+                    raise ValueError(
+                        "sample_weight must contain at least one positive value."
+                    )
+            else:
+                if not np.all(sample_weight > 0):
+                    raise ValueError("sample_weight must be strictly positive.")
 
         if sample_weight_eval is not None and (X_eval is None or y_eval is None):
             raise ValueError(
@@ -387,9 +450,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 raise ValueError(
                     f"era_id must be 1-dimensional, got shape {era_id.shape}"
                 )
-            if len(era_id) != len(y):
+            if len(era_id) != X.shape[0]:
                 raise ValueError(
-                    f"era_id must have same length as y. Got {len(era_id)} and {len(y)}."
+                    f"era_id must have same length as y. Got {len(era_id)} and {X.shape[0]}."
                 )
 
         # ─── Optional: Eval Set ───
@@ -407,10 +470,22 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 raise ValueError(
                     f"X_eval must be 2-dimensional, got shape {X_eval.shape}"
                 )
-            if y_eval.ndim != 1:
-                raise ValueError(
-                    f"y_eval must be 1-dimensional, got shape {y_eval.shape}"
-                )
+
+            if is_multi_regression:
+                if y_eval.ndim != 2:
+                    raise ValueError(
+                        f"y_eval must be 2-dimensional for objective='multi_regression', got shape {y_eval.shape}"
+                    )
+                if y_eval.shape[1] != y.shape[1]:
+                    raise ValueError(
+                        f"y_eval must have the same number of outputs as y. Got {y_eval.shape[1]} and {y.shape[1]}."
+                    )
+            else:
+                if y_eval.ndim != 1:
+                    raise ValueError(
+                        f"y_eval must be 1-dimensional, got shape {y_eval.shape}"
+                    )
+
             if X_eval.shape[0] != y_eval.shape[0]:
                 raise ValueError(
                     f"X_eval and y_eval must have same number of rows. Got {X_eval.shape[0]} and {y_eval.shape[0]}."
@@ -419,20 +494,40 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             if sample_weight_eval is not None:
                 if not isinstance(sample_weight_eval, np.ndarray):
                     raise TypeError("sample_weight_eval must be a numpy array.")
-                if sample_weight_eval.ndim != 1:
-                    raise ValueError(
-                        f"sample_weight_eval must be 1-dimensional, got shape {sample_weight_eval.shape}"
+
+                if is_multi_regression:
+                    self._validate_multi_output_weight_shape(
+                        sample_weight_eval,
+                        y_eval.shape,
+                        "sample_weight_eval",
                     )
-                if len(sample_weight_eval) != len(y_eval):
-                    raise ValueError(
-                        f"sample_weight_eval must have same length as y_eval. Got {len(sample_weight_eval)} and {len(y_eval)}."
-                    )
+                else:
+                    if sample_weight_eval.ndim != 1:
+                        raise ValueError(
+                            f"sample_weight_eval must be 1-dimensional, got shape {sample_weight_eval.shape}"
+                        )
+                    if len(sample_weight_eval) != len(y_eval):
+                        raise ValueError(
+                            f"sample_weight_eval must have same length as y_eval. Got {len(sample_weight_eval)} and {len(y_eval)}."
+                        )
+
                 if not np.all(np.isfinite(sample_weight_eval)):
                     raise ValueError(
                         "sample_weight_eval must contain only finite values."
                     )
-                if not np.all(sample_weight_eval > 0):
-                    raise ValueError("sample_weight_eval must be strictly positive.")
+
+                if is_multi_regression:
+                    if not np.all(sample_weight_eval >= 0):
+                        raise ValueError("sample_weight_eval must be non-negative.")
+                    if not np.any(sample_weight_eval > 0):
+                        raise ValueError(
+                            "sample_weight_eval must contain at least one positive value."
+                        )
+                else:
+                    if not np.all(sample_weight_eval > 0):
+                        raise ValueError(
+                            "sample_weight_eval must be strictly positive."
+                        )
 
             if not isinstance(eval_every_n_trees, int) or eval_every_n_trees <= 0:
                 raise ValueError(
@@ -451,13 +546,45 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 # No early stopping = set to "never trigger"
                 early_stopping_rounds = self.n_estimators + 1
 
-            valid_metrics = ["mse", "corr", "rmsle", "logloss", "accuracy"]
+            if is_multi_regression:
+                valid_metrics = ["mse"]
+            else:
+                valid_metrics = ["mse", "corr", "rmsle", "logloss", "accuracy"]
             if eval_metric not in valid_metrics:
                 raise ValueError(
                     f"Invalid eval_metric: {eval_metric}. Choose from {valid_metrics}."
                 )
 
         return early_stopping_rounds  # May have been defaulted here
+
+    def _validate_multi_output_weight_shape(self, weight_np, y_shape, weight_name):
+        n_samples, n_outputs = y_shape
+        if weight_np.ndim == 1:
+            if weight_np.shape[0] != n_samples:
+                raise ValueError(
+                    f"{weight_name} must have same length as y rows. Got {weight_np.shape[0]} and {n_samples}."
+                )
+            return
+
+        if weight_np.ndim == 2:
+            if weight_np.shape != (n_samples, n_outputs):
+                raise ValueError(
+                    f"{weight_name} must have shape {(n_samples, n_outputs)} for multi-output targets, got {weight_np.shape}."
+                )
+            return
+
+        raise ValueError(
+            f"{weight_name} must be 1-dimensional or 2-dimensional, got shape {weight_np.shape}."
+        )
+
+    def _expand_multi_output_weight(self, weight_np, n_outputs):
+        if weight_np.ndim == 1:
+            return np.repeat(weight_np[:, None], n_outputs, axis=1)
+        if weight_np.ndim == 2:
+            return weight_np
+        raise ValueError(
+            f"sample weights must be 1D or 2D, got shape {weight_np.shape}"
+        )
 
     def _normalize_sample_weight(self, weight_np: np.ndarray) -> np.ndarray:
         weight_np = weight_np.astype(np.float32, copy=False)
@@ -468,31 +595,35 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
     def _invalidate_prediction_cache(self):
         self._cached_regression_tree_tensor = None
+        self._cached_multi_regression_tree_tensors = None
         self._cached_multiclass_tree_tensors = None
         self._cached_tree_device = None
         self._cached_tree_max_nodes = None
         self._cached_tree_objective = None
         self._cached_tree_rounds = None
+        self._cached_tree_num_outputs = None
 
-    def _prediction_cache_matches(self, objective_key, max_nodes):
+    def _prediction_cache_matches(self, objective_key, max_nodes, num_outputs=None):
         return (
             self._cached_tree_device == str(self.device)
             and self._cached_tree_max_nodes == max_nodes
             and self._cached_tree_objective == objective_key
             and self._cached_tree_rounds == self._trees_trained
+            and self._cached_tree_num_outputs == num_outputs
         )
 
-    def _set_prediction_cache_meta(self, objective_key, max_nodes):
+    def _set_prediction_cache_meta(self, objective_key, max_nodes, num_outputs=None):
         self._cached_tree_device = str(self.device)
         self._cached_tree_max_nodes = max_nodes
         self._cached_tree_objective = objective_key
         self._cached_tree_rounds = self._trees_trained
+        self._cached_tree_num_outputs = num_outputs
 
     def _get_cached_regression_tree_tensor(self):
         max_nodes = 2 ** (self.max_depth + 1)
         if (
             self._cached_regression_tree_tensor is not None
-            and self._prediction_cache_matches("regression", max_nodes)
+            and self._prediction_cache_matches("regression", max_nodes, num_outputs=1)
         ):
             return self._cached_regression_tree_tensor
 
@@ -510,15 +641,20 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             )
 
         self._cached_regression_tree_tensor = tree_tensor
+        self._cached_multi_regression_tree_tensors = None
         self._cached_multiclass_tree_tensors = None
-        self._set_prediction_cache_meta("regression", max_nodes)
+        self._set_prediction_cache_meta("regression", max_nodes, num_outputs=1)
         return tree_tensor
 
     def _get_cached_multiclass_tree_tensors(self):
         max_nodes = 2 ** (self.max_depth + 1)
         if (
             self._cached_multiclass_tree_tensors is not None
-            and self._prediction_cache_matches("classification", max_nodes)
+            and self._prediction_cache_matches(
+                "classification",
+                max_nodes,
+                num_outputs=self.num_classes,
+            )
         ):
             return self._cached_multiclass_tree_tensors
 
@@ -541,8 +677,58 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         self._cached_multiclass_tree_tensors = class_tree_tensors
         self._cached_regression_tree_tensor = None
-        self._set_prediction_cache_meta("classification", max_nodes)
+        self._cached_multi_regression_tree_tensors = None
+        self._set_prediction_cache_meta(
+            "classification",
+            max_nodes,
+            num_outputs=self.num_classes,
+        )
         return class_tree_tensors
+
+    def _get_cached_multi_regression_tree_tensors(self):
+        max_nodes = 2 ** (self.max_depth + 1)
+        if (
+            self._cached_multi_regression_tree_tensors is not None
+            and self._prediction_cache_matches(
+                "multi_regression",
+                max_nodes,
+                num_outputs=self.num_outputs,
+            )
+        ):
+            return self._cached_multi_regression_tree_tensors
+
+        trees = [tree for tree in self.forest[: self._trees_trained] if tree]
+        if not trees:
+            trees = [tree for tree in self.forest if tree]
+
+        tree_tensors = []
+        for out_idx in range(self.num_outputs):
+            if trees:
+                tree_tensor = torch.stack(
+                    [
+                        self.flatten_tree(
+                            tree,
+                            max_nodes=max_nodes,
+                            output_index=out_idx,
+                        )
+                        for tree in trees
+                    ]
+                ).to(self.device)
+            else:
+                tree_tensor = torch.empty(
+                    (0, max_nodes, 6), dtype=torch.float32, device=self.device
+                )
+            tree_tensors.append(tree_tensor)
+
+        self._cached_multi_regression_tree_tensors = tree_tensors
+        self._cached_regression_tree_tensor = None
+        self._cached_multiclass_tree_tensors = None
+        self._set_prediction_cache_meta(
+            "multi_regression",
+            max_nodes,
+            num_outputs=self.num_outputs,
+        )
+        return tree_tensors
 
     def fit(
         self,
@@ -570,16 +756,32 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             sample_weight_eval,
         )
 
-        if sample_weight is None:
-            sample_weight = np.ones(X.shape[0], dtype=np.float32)
-        else:
-            sample_weight = self._normalize_sample_weight(sample_weight)
-
-        if X_eval is not None and y_eval is not None:
-            if sample_weight_eval is None:
-                sample_weight_eval = np.ones(X_eval.shape[0], dtype=np.float32)
+        if self.objective == "multi_regression":
+            if sample_weight is None:
+                sample_weight = np.ones_like(y, dtype=np.float32)
             else:
-                sample_weight_eval = self._normalize_sample_weight(sample_weight_eval)
+                sample_weight = self._normalize_sample_weight(sample_weight)
+
+            if X_eval is not None and y_eval is not None:
+                if sample_weight_eval is None:
+                    sample_weight_eval = np.ones_like(y_eval, dtype=np.float32)
+                else:
+                    sample_weight_eval = self._normalize_sample_weight(
+                        sample_weight_eval
+                    )
+        else:
+            if sample_weight is None:
+                sample_weight = np.ones(X.shape[0], dtype=np.float32)
+            else:
+                sample_weight = self._normalize_sample_weight(sample_weight)
+
+            if X_eval is not None and y_eval is not None:
+                if sample_weight_eval is None:
+                    sample_weight_eval = np.ones(X_eval.shape[0], dtype=np.float32)
+                else:
+                    sample_weight_eval = self._normalize_sample_weight(
+                        sample_weight_eval
+                    )
 
         # Set random seed for reproducibility
         if self.random_state is not None:
@@ -597,7 +799,11 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             # Fresh start: reset training state
             self._is_fitted = False
             self._trees_trained = 0
-            self.forest = [{} for _ in range(self.n_estimators)] if self.objective == "regression" else []
+            self.forest = (
+                [{} for _ in range(self.n_estimators)]
+                if self.objective in ["regression", "multi_regression"]
+                else []
+            )
             self.training_loss = []
             self.eval_loss = []
             self._invalidate_prediction_cache()
@@ -646,6 +852,19 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 early_stopping_rounds,
                 eval_metric,
             )
+        elif self.objective == "multi_regression":
+            return self._fit_multi_regression(
+                X,
+                y,
+                era_id,
+                X_eval,
+                y_eval,
+                sample_weight,
+                sample_weight_eval,
+                eval_every_n_trees,
+                early_stopping_rounds,
+                eval_metric,
+            )
         else:
             # Regression path (unchanged)
             return self._fit_regression(
@@ -675,6 +894,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         eval_metric,
     ):
         """Original regression fitting logic"""
+        self.num_outputs = 1
+        self.valid_target_mask_gpu = None
+        self.valid_target_mask_eval_gpu = None
+        self.grad_split = None
+        self.hess_split = None
+
         # Train data preprocessing
         self.bin_indices, self.era_indices, self.bin_edges, self.unique_eras, self.Y_gpu = (
             self.preprocess_gpu_data(X, y, era_id)
@@ -732,6 +957,177 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         return self
 
+    def _fit_multi_regression(
+        self,
+        X,
+        y,
+        era_id,
+        X_eval,
+        y_eval,
+        sample_weight,
+        sample_weight_eval,
+        eval_every_n_trees,
+        early_stopping_rounds,
+        eval_metric,
+    ):
+        """Vector-leaf multi-output regression fitting logic."""
+        previous_num_outputs = self.num_outputs
+        n_outputs = y.shape[1]
+        if (
+            self.warm_start
+            and self._is_fitted
+            and previous_num_outputs is not None
+            and previous_num_outputs != n_outputs
+        ):
+            raise ValueError(
+                "Number of target outputs must match the fitted model when warm_start=True. "
+                f"Got {n_outputs} and {previous_num_outputs}."
+            )
+
+        self.num_outputs = n_outputs
+        y_filled = np.nan_to_num(y.astype(np.float32, copy=False), nan=0.0)
+        valid_mask_np = np.isfinite(y)
+
+        # Train data preprocessing
+        (
+            self.bin_indices,
+            self.era_indices,
+            self.bin_edges,
+            self.unique_eras,
+            self.Y_gpu,
+        ) = self.preprocess_gpu_data(X, y_filled, era_id)
+        self.num_samples, self.num_features = X.shape
+        self.num_eras = len(self.unique_eras)
+        self.era_indices = self.era_indices.to(dtype=torch.int32)
+        self.valid_target_mask_gpu = (
+            torch.from_numpy(valid_mask_np).to(torch.bool).to(self.device)
+        )
+
+        sample_weight_2d = self._expand_multi_output_weight(
+            sample_weight, self.num_outputs
+        )
+        self.sample_weight_gpu = (
+            torch.from_numpy(sample_weight_2d).to(torch.float32).to(self.device)
+        )
+
+        effective_weight = self.sample_weight_gpu * self.valid_target_mask_gpu.to(
+            torch.float32
+        )
+
+        # Initialize gradients (predictions)
+        if self.warm_start and self._is_fitted and self._trees_trained > 0:
+            base_prediction = self.base_prediction
+            if not torch.is_tensor(base_prediction):
+                base_prediction = torch.as_tensor(
+                    base_prediction,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            else:
+                base_prediction = base_prediction.to(
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+
+            if base_prediction.numel() != self.num_outputs:
+                raise ValueError(
+                    "Stored base_prediction is incompatible with the requested number "
+                    f"of outputs ({self.num_outputs})."
+                )
+
+            self.base_prediction = base_prediction
+            self.gradients = (
+                torch.zeros(
+                    (self.num_samples, self.num_outputs),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                + self.base_prediction
+            )
+
+            # Warm start: restore predictions from existing forest
+            for tree in self.forest[: self._trees_trained]:
+                if tree:
+                    leaf_updates = self._compute_tree_predictions(
+                        tree, self.bin_indices
+                    )
+                    self.gradients += leaf_updates
+        else:
+            # Fresh start
+            weighted_target_sum = torch.sum(self.Y_gpu * effective_weight, dim=0)
+            weight_sum = torch.sum(effective_weight, dim=0)
+            self.base_prediction = torch.where(
+                weight_sum > 0,
+                weighted_target_sum / torch.clamp(weight_sum, min=1e-12),
+                torch.zeros_like(weight_sum),
+            )
+            self.gradients = (
+                torch.zeros(
+                    (self.num_samples, self.num_outputs),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                + self.base_prediction
+            )
+
+        self.root_node_indices = torch.arange(
+            self.num_samples,
+            device=self.device,
+            dtype=torch.int32,
+        )
+        self.feature_indices = torch.arange(
+            self.num_features,
+            device=self.device,
+            dtype=torch.int32,
+        )
+
+        # ─── Optional Eval Set ───
+        if X_eval is not None and y_eval is not None:
+            y_eval_filled = np.nan_to_num(
+                y_eval.astype(np.float32, copy=False), nan=0.0
+            )
+            valid_mask_eval_np = np.isfinite(y_eval)
+
+            self.bin_indices_eval = self.bin_inference_data(X_eval)
+            self.Y_gpu_eval = (
+                torch.from_numpy(y_eval_filled).to(torch.float32).to(self.device)
+            )
+            self.valid_target_mask_eval_gpu = (
+                torch.from_numpy(valid_mask_eval_np).to(torch.bool).to(self.device)
+            )
+
+            sample_weight_eval_2d = self._expand_multi_output_weight(
+                sample_weight_eval,
+                self.num_outputs,
+            )
+            self.sample_weight_eval_gpu = (
+                torch.from_numpy(sample_weight_eval_2d)
+                .to(torch.float32)
+                .to(self.device)
+            )
+            self.eval_every_n_trees = eval_every_n_trees
+            self.early_stopping_rounds = early_stopping_rounds
+            self.eval_metric = eval_metric
+        else:
+            self.bin_indices_eval = None
+            self.Y_gpu_eval = None
+            self.sample_weight_eval_gpu = None
+            self.eval_every_n_trees = None
+            self.early_stopping_rounds = None
+            self.valid_target_mask_eval_gpu = None
+
+        # ─── Grow the forest ───
+        with torch.no_grad():
+            self.grow_forest_multi_regression()
+
+        del self.bin_indices
+        del self.Y_gpu
+        self.valid_target_mask_gpu = None
+
+        gc.collect()
+
+        return self
+
     def _fit_classification(
         self,
         X,
@@ -746,6 +1142,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         eval_metric,
     ):
         """Multiclass classification fitting logic"""
+        self.num_outputs = None
+        self.valid_target_mask_gpu = None
+        self.valid_target_mask_eval_gpu = None
+        self.grad_split = None
+        self.hess_split = None
+
         # Train data preprocessing
         self.bin_indices, self.era_indices, self.bin_edges, self.unique_eras, _ = (
             self.preprocess_gpu_data(X, y_encoded, era_id)
@@ -961,6 +1363,17 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
     def grow_tree(self, gradient_histogram, hessian_histogram, node_indices, depth, class_k=None):
         if depth == self.max_depth:
+            if self.objective == "multi_regression" and class_k is None:
+                node_hess = self.hess[node_indices]
+                leaf_value = torch.sum(self.grad[node_indices], dim=0) / (
+                    torch.sum(node_hess, dim=0) + self.L2_reg
+                )
+                self.gradients[node_indices] += self.learning_rate * leaf_value
+                return {
+                    "leaf_value": leaf_value.detach().cpu().tolist(),
+                    "samples": node_indices.numel(),
+                }
+
             node_hess = self.hess[node_indices]
             leaf_value = torch.sum(self.grad[node_indices]) / (
                 torch.sum(node_hess) + self.L2_reg
@@ -979,6 +1392,17 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         )
 
         if local_feature == -1:
+            if self.objective == "multi_regression" and class_k is None:
+                node_hess = self.hess[node_indices]
+                leaf_value = torch.sum(self.grad[node_indices], dim=0) / (
+                    torch.sum(node_hess, dim=0) + self.L2_reg
+                )
+                self.gradients[node_indices] += self.learning_rate * leaf_value
+                return {
+                    "leaf_value": leaf_value.detach().cpu().tolist(),
+                    "samples": parent_size,
+                }
+
             node_hess = self.hess[node_indices]
             leaf_value = torch.sum(self.grad[node_indices]) / (
                 torch.sum(node_hess) + self.L2_reg
@@ -1005,12 +1429,18 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         left_size = left_indices.numel()
         right_size = right_indices.numel()
 
+        hist_grad = self.grad
+        hist_hess = self.hess
+        if self.objective == "multi_regression" and class_k is None:
+            hist_grad = self.grad_split
+            hist_hess = self.hess_split
+
         if left_size <= right_size:
             grad_hist_left, hess_hist_left = self.compute_histograms(
                 left_indices,
                 self.feat_indices_tree,
-                self.grad,
-                self.hess,
+                hist_grad,
+                hist_hess,
             )
             grad_hist_right = gradient_histogram - grad_hist_left
             hess_hist_right = hessian_histogram - hess_hist_left
@@ -1018,8 +1448,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             grad_hist_right, hess_hist_right = self.compute_histograms(
                 right_indices,
                 self.feat_indices_tree,
-                self.grad,
-                self.hess,
+                hist_grad,
+                hist_hess,
             )
             grad_hist_left = gradient_histogram - grad_hist_right
             hess_hist_left = hessian_histogram - hess_hist_right
@@ -1148,6 +1578,143 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._is_fitted = True
 
         print(f"Finished training forest. Total trees: {self._trees_trained}")
+
+    def compute_eval_multi_regression(self, i):
+        if self.eval_every_n_trees is None:
+            return
+
+        train_loss = weighted_multi_mse_torch(
+            self.Y_gpu,
+            self.gradients,
+            sample_weight=self.sample_weight_gpu,
+            valid_mask=self.valid_target_mask_gpu,
+        ).item()
+        self.training_loss.append(train_loss)
+
+        if i % self.eval_every_n_trees == 0:
+            eval_preds = self.predict_binned(self.bin_indices_eval)
+            eval_loss = weighted_multi_mse_torch(
+                self.Y_gpu_eval,
+                eval_preds,
+                sample_weight=self.sample_weight_eval_gpu,
+                valid_mask=self.valid_target_mask_eval_gpu,
+            ).item()
+            self.eval_loss.append(eval_loss)
+
+            if len(self.eval_loss) > self.early_stopping_rounds:
+                if (
+                    self.eval_loss[-(self.early_stopping_rounds + 1)]
+                    < self.eval_loss[-1]
+                ):
+                    self.stop = True
+
+            print(
+                f"🌲 Tree {i+1}/{self.n_estimators} | "
+                f"Train multi_regression MSE: {train_loss:.6f} | "
+                f"Eval MSE: {eval_loss:.6f}"
+            )
+
+            del eval_preds, eval_loss, train_loss
+
+    def grow_forest_multi_regression(self):
+        """Multi-output regression forest growing with shared split structure and vector leaves."""
+        if (
+            not hasattr(self, "training_loss")
+            or not self.warm_start
+            or not self._is_fitted
+        ):
+            self.training_loss = []
+            self.eval_loss = []
+            self.per_era_feature_importance_ = np.zeros(
+                (self.num_eras, self.num_features),
+                dtype=np.float32,
+            )
+
+        self.stop = False
+
+        if self.colsample_bytree < 1.0:
+            k = max(1, int(self.colsample_bytree * self.num_features))
+        else:
+            self.feat_indices_tree = self.feature_indices
+            k = self.num_features
+
+        self.per_era_gain = torch.zeros(
+            self.num_eras,
+            k,
+            self.num_bins - 1,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.per_era_direction = torch.zeros(
+            self.num_eras,
+            k,
+            self.num_bins - 1,
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+        start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
+
+        if len(self.forest) < self.n_estimators:
+            self.forest.extend(
+                [{} for _ in range(self.n_estimators - len(self.forest))]
+            )
+
+        valid_mask_float = self.valid_target_mask_gpu.to(torch.float32)
+        for i in range(start_iter, self.n_estimators):
+            grad_raw = self.Y_gpu - self.gradients
+            grad_raw = torch.where(
+                self.valid_target_mask_gpu,
+                grad_raw,
+                torch.zeros_like(grad_raw),
+            )
+
+            self.hess = self.sample_weight_gpu * valid_mask_float
+            self.grad = grad_raw * self.hess
+
+            # Shared split criterion across outputs: sum gradients/hessians per sample.
+            split_grad = torch.sum(self.grad, dim=1)
+            split_hess = torch.sum(self.hess, dim=1)
+            self.grad_split = split_grad
+            self.hess_split = split_hess
+
+            if self.colsample_bytree < 1.0:
+                self.feat_indices_tree = torch.randperm(
+                    self.num_features,
+                    device=self.device,
+                    dtype=torch.int32,
+                )[:k]
+
+            self.root_gradient_histogram, self.root_hessian_histogram = (
+                self.compute_histograms(
+                    self.root_node_indices,
+                    self.feat_indices_tree,
+                    split_grad,
+                    split_hess,
+                )
+            )
+
+            tree = self.grow_tree(
+                self.root_gradient_histogram,
+                self.root_hessian_histogram,
+                self.root_node_indices,
+                0,
+            )
+            self.forest[i] = tree
+            self._trees_trained = i + 1
+            self._invalidate_prediction_cache()
+
+            self.compute_eval_multi_regression(i)
+
+            if self.stop:
+                break
+
+        self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
+        self._is_fitted = True
+
+        print(
+            f"Finished training multi-output forest. Total trees: {self._trees_trained}"
+        )
 
     def grow_forest_multiclass(self):
         """Multiclass forest growing - K trees per iteration"""
@@ -1334,6 +1901,48 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
     def predict_binned(self, bin_indices):
         num_samples = bin_indices.size(0)
+        if self.objective == "multi_regression":
+            tree_tensors = self._get_cached_multi_regression_tree_tensors()
+            base_prediction = self.base_prediction
+            if not torch.is_tensor(base_prediction):
+                base_prediction = torch.as_tensor(
+                    base_prediction,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            else:
+                base_prediction = base_prediction.to(
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+
+            out = (
+                torch.zeros(
+                    (num_samples, self.num_outputs),
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                + base_prediction
+            )
+
+            bin_indices_contiguous = bin_indices.contiguous()
+            for out_idx, tree_tensor in enumerate(tree_tensors):
+                if tree_tensor.size(0) == 0:
+                    continue
+
+                out_col = torch.zeros(
+                    num_samples, device=self.device, dtype=torch.float32
+                )
+                _get_node_kernel().predict_forest(
+                    bin_indices_contiguous,
+                    tree_tensor.contiguous(),
+                    self.learning_rate,
+                    out_col,
+                )
+                out[:, out_idx] += out_col
+
+            return out
+
         tree_tensor = self._get_cached_regression_tree_tensor()
 
         out = torch.full(
@@ -1390,6 +1999,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             bin_indices = self.bin_inference_data(X_np)
             preds = self.predict_binned(bin_indices).cpu().numpy()
             del bin_indices
+            if self.objective == "regression":
+                return preds.reshape(-1)
             return preds
 
     def predict_proba(self, X_np):
@@ -1556,6 +2167,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             "base_prediction": self.base_prediction,
             "num_features": self.num_features,
             "num_classes": self.num_classes,
+            "num_outputs": self.num_outputs,
             "classes_": self.classes_,
             "label_encoder": self.label_encoder,
             "feature_importance_": self.feature_importance_,
@@ -1622,6 +2234,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.base_prediction = state['base_prediction']
         self.num_features = state['num_features']
         self.num_classes = state['num_classes']
+        self.num_outputs = state.get(
+            "num_outputs", 1 if self.objective == "regression" else None
+        )
         self.classes_ = state['classes_']
         self.label_encoder = state['label_encoder']
         self.feature_importance_ = state['feature_importance_']
@@ -1640,14 +2255,32 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             "_monotonic_constraints_fitted_",
             self.monotonic_constraints_vector_ is not None,
         )
+
+        if self.objective == "multi_regression":
+            if not torch.is_tensor(self.base_prediction):
+                self.base_prediction = torch.as_tensor(
+                    self.base_prediction,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            else:
+                self.base_prediction = self.base_prediction.to(
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+        elif torch.is_tensor(self.base_prediction):
+            self.base_prediction = float(self.base_prediction.item())
+
         self.monotonic_required_split_direction_gpu_ = None
+        self.valid_target_mask_gpu = None
+        self.valid_target_mask_eval_gpu = None
         self._invalidate_prediction_cache()
 
         print(f"Model loaded from {path} ({self._trees_trained} trees)")
 
         return self
 
-    def flatten_tree(self, tree, max_nodes):
+    def flatten_tree(self, tree, max_nodes, output_index=None):
         flat = torch.full((max_nodes, 6), float("nan"), dtype=torch.float32)
         node_counter = [0]
         node_list = []
@@ -1658,7 +2291,15 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
             new_node = {"node_id": curr_id}
             if "leaf_value" in node:
-                new_node["leaf_value"] = float(node["leaf_value"])
+                leaf_value = node["leaf_value"]
+                if isinstance(leaf_value, torch.Tensor):
+                    leaf_value = leaf_value.detach().cpu().tolist()
+
+                if isinstance(leaf_value, (list, tuple, np.ndarray)):
+                    idx = 0 if output_index is None else output_index
+                    new_node["leaf_value"] = float(leaf_value[idx])
+                else:
+                    new_node["leaf_value"] = float(leaf_value)
             else:
                 new_node["best_feature"] = float(node["feature"])
                 new_node["split_bin"] = float(node["bin"])

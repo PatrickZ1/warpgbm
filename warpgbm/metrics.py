@@ -49,6 +49,40 @@ def weighted_mse_torch(y_true, y_pred, sample_weight=None):
     return torch.sum(weights * err2) / torch.sum(weights)
 
 
+def weighted_multi_mse_torch(y_true, y_pred, sample_weight=None, valid_mask=None):
+    if y_true.ndim != 2 or y_pred.ndim != 2:
+        raise ValueError(
+            "weighted_multi_mse_torch expects 2D tensors [n_samples, n_outputs]."
+        )
+    if y_true.shape != y_pred.shape:
+        raise ValueError(
+            f"y_true and y_pred must have matching shape, got {y_true.shape} and {y_pred.shape}."
+        )
+
+    if valid_mask is None:
+        valid_mask = torch.isfinite(y_true)
+    if valid_mask.shape != y_true.shape:
+        raise ValueError(
+            f"valid_mask must match y_true shape, got {valid_mask.shape} and {y_true.shape}."
+        )
+
+    weights = _normalize_weights(sample_weight, y_true).to(dtype=torch.float32)
+    if weights.ndim == 1:
+        weights = weights.view(-1, 1)
+    if weights.shape != y_true.shape:
+        raise ValueError(
+            f"sample_weight must be shape {y_true.shape} or {(y_true.shape[0],)}, got {weights.shape}."
+        )
+
+    valid_mask_f = valid_mask.to(dtype=torch.float32)
+    err2 = torch.where(valid_mask, (y_true - y_pred) ** 2, torch.zeros_like(y_pred))
+    effective_weights = weights * valid_mask_f
+    denom = torch.sum(effective_weights)
+    if denom <= 0:
+        raise ValueError("No valid weighted targets available for multi-output MSE.")
+    return torch.sum(effective_weights * err2) / denom
+
+
 def weighted_rmsle_torch(y_true, y_pred, sample_weight=None, eps=1e-7):
     weights = _normalize_weights(sample_weight, y_true)
     y_true = torch.clamp(y_true, min=0)
