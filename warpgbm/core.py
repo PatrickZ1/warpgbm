@@ -129,6 +129,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._monotonic_constraints_fitted_ = False
         self._is_fitted = False
         self._trees_trained = 0  # Track number of trees already trained
+        self._cached_regression_tree_tensor = None
+        self._cached_multiclass_tree_tensors = None
+        self._cached_tree_device = None
+        self._cached_tree_max_nodes = None
+        self._cached_tree_objective = None
+        self._cached_tree_rounds = None
 
     def _validate_hyperparams(self, **kwargs):
         # Validate objective
@@ -460,6 +466,84 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             raise ValueError("sample weights must have positive mean.")
         return weight_np / mean_w
 
+    def _invalidate_prediction_cache(self):
+        self._cached_regression_tree_tensor = None
+        self._cached_multiclass_tree_tensors = None
+        self._cached_tree_device = None
+        self._cached_tree_max_nodes = None
+        self._cached_tree_objective = None
+        self._cached_tree_rounds = None
+
+    def _prediction_cache_matches(self, objective_key, max_nodes):
+        return (
+            self._cached_tree_device == str(self.device)
+            and self._cached_tree_max_nodes == max_nodes
+            and self._cached_tree_objective == objective_key
+            and self._cached_tree_rounds == self._trees_trained
+        )
+
+    def _set_prediction_cache_meta(self, objective_key, max_nodes):
+        self._cached_tree_device = str(self.device)
+        self._cached_tree_max_nodes = max_nodes
+        self._cached_tree_objective = objective_key
+        self._cached_tree_rounds = self._trees_trained
+
+    def _get_cached_regression_tree_tensor(self):
+        max_nodes = 2 ** (self.max_depth + 1)
+        if (
+            self._cached_regression_tree_tensor is not None
+            and self._prediction_cache_matches("regression", max_nodes)
+        ):
+            return self._cached_regression_tree_tensor
+
+        trees = [tree for tree in self.forest[: self._trees_trained] if tree]
+        if not trees:
+            trees = [tree for tree in self.forest if tree]
+
+        if trees:
+            tree_tensor = torch.stack(
+                [self.flatten_tree(tree, max_nodes=max_nodes) for tree in trees]
+            ).to(self.device)
+        else:
+            tree_tensor = torch.empty(
+                (0, max_nodes, 6), dtype=torch.float32, device=self.device
+            )
+
+        self._cached_regression_tree_tensor = tree_tensor
+        self._cached_multiclass_tree_tensors = None
+        self._set_prediction_cache_meta("regression", max_nodes)
+        return tree_tensor
+
+    def _get_cached_multiclass_tree_tensors(self):
+        max_nodes = 2 ** (self.max_depth + 1)
+        if (
+            self._cached_multiclass_tree_tensors is not None
+            and self._prediction_cache_matches("classification", max_nodes)
+        ):
+            return self._cached_multiclass_tree_tensors
+
+        class_tree_lists = [[] for _ in range(self.num_classes)]
+        for round_trees in self.forest[: self._trees_trained]:
+            if not round_trees:
+                continue
+            for class_k, tree in enumerate(round_trees):
+                if tree:
+                    class_tree_lists[class_k].append(
+                        self.flatten_tree(tree, max_nodes=max_nodes)
+                    )
+
+        class_tree_tensors = []
+        for class_trees in class_tree_lists:
+            if class_trees:
+                class_tree_tensors.append(torch.stack(class_trees).to(self.device))
+            else:
+                class_tree_tensors.append(None)
+
+        self._cached_multiclass_tree_tensors = class_tree_tensors
+        self._cached_regression_tree_tensor = None
+        self._set_prediction_cache_meta("classification", max_nodes)
+        return class_tree_tensors
+
     def fit(
         self,
         X,
@@ -516,6 +600,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.forest = [{} for _ in range(self.n_estimators)] if self.objective == "regression" else []
             self.training_loss = []
             self.eval_loss = []
+            self._invalidate_prediction_cache()
         else:
             # Continuing training: validate that data is compatible
             if X.shape[1] != self.num_features:
@@ -740,12 +825,16 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         with torch.no_grad():
             self.num_samples, self.num_features = X_np.shape
 
-            Y_gpu = torch.from_numpy(Y_np).type(torch.float32).to(self.device)
+            Y_gpu = torch.from_numpy(Y_np).to(dtype=torch.float32, device=self.device)
 
-            era_id_gpu = torch.from_numpy(era_id_np).type(torch.int32).to(self.device)
+            era_id_gpu = torch.from_numpy(era_id_np).to(
+                dtype=torch.int32, device=self.device
+            )
 
             bin_indices = torch.empty(
-                (self.num_samples, self.num_features), dtype=torch.int8, device="cuda"
+                (self.num_samples, self.num_features),
+                dtype=torch.int8,
+                device=self.device,
             )
 
             is_integer_type = np.issubdtype(X_np.dtype, np.integer)
@@ -753,9 +842,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
             if is_integer_type and np.all(max_vals < self.num_bins):
                 print("Detected pre-binned integer input — skipping quantile binning.")
-                for f in range(self.num_features):
-                    bin_indices[:,f] = torch.as_tensor( X_np[:, f], device=self.device).contiguous()
-                # bin_indices = X_np.to("cuda", non_blocking=True).contiguous()
+                X_prebinned = torch.as_tensor(X_np, device=self.device)
+                bin_indices.copy_(X_prebinned.to(dtype=torch.int8))
 
                 # We'll store None or an empty tensor in self.bin_edges
                 # to indicate that we skip binning at predict-time
@@ -771,13 +859,17 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             bin_edges = torch.empty(
                 (self.num_features, self.num_bins - 1),
                 dtype=torch.float32,
-                device="cuda",
+                device=self.device,
             )
 
+            X_float = torch.as_tensor(
+                X_np, device=self.device, dtype=torch.float32
+            ).contiguous()
+
             for f in range(self.num_features):
-                X_f = torch.as_tensor( X_np[:, f], device=self.device, dtype=torch.float32 ).contiguous()
+                X_f = X_float[:, f].contiguous()
                 quantiles = torch.linspace(
-                    0, 1, self.num_bins + 1, device="cuda", dtype=X_f.dtype
+                    0, 1, self.num_bins + 1, device=self.device, dtype=X_f.dtype
                 )[1:-1]
                 bin_edges_f = torch.quantile(
                     X_f, quantiles, dim=0
@@ -902,8 +994,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         # Track feature importance: accumulate per-era gains for the chosen feature
         global_feature_idx = self.feat_indices_tree[local_feature].item()
         per_era_gains = self.per_era_gain[:, local_feature, best_bin]  # [num_eras]
-        for era_idx in range(self.num_eras):
-            self.per_era_feature_importance_[era_idx, global_feature_idx] += per_era_gains[era_idx].item()
+        self.per_era_feature_importance_[:, global_feature_idx] += (
+            per_era_gains.detach().cpu().numpy()
+        )
 
         split_mask = self.bin_indices[node_indices, self.feat_indices_tree[local_feature]] <= best_bin
         left_indices = node_indices[split_mask]
@@ -1043,6 +1136,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             )
             self.forest[i] = tree
             self._trees_trained = i + 1
+            self._invalidate_prediction_cache()
 
             self.compute_eval(i)
 
@@ -1116,6 +1210,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
             self.forest.append(trees_k)
             self._trees_trained = i + 1
+            self._invalidate_prediction_cache()
 
             self.compute_eval_multiclass(i)
 
@@ -1219,33 +1314,41 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
     def bin_data_with_existing_edges(self, X_np):
         num_samples = X_np.shape[0]
-        bin_indices = torch.zeros(
-            (num_samples, self.num_features), dtype=torch.int8, device=self.device
+        X_float_t = (
+            torch.as_tensor(X_np, device=self.device, dtype=torch.float32)
+            .transpose(0, 1)
+            .contiguous()
+        )
+        bin_indices_t = torch.empty(
+            (self.num_features, num_samples), dtype=torch.int8, device=self.device
         )
         with torch.no_grad():
             for f in range(self.num_features):
-                X_f = torch.as_tensor( X_np[:, f], device=self.device, dtype=torch.float32 ).contiguous()
-                bin_edges_f = self.bin_edges[f]
-                bin_indices_f = bin_indices[:, f].contiguous()
-                _get_node_kernel().custom_cuda_binner(X_f, bin_edges_f, bin_indices_f)
-                bin_indices[:, f] = bin_indices_f
+                _get_node_kernel().custom_cuda_binner(
+                    X_float_t[f],
+                    self.bin_edges[f],
+                    bin_indices_t[f],
+                )
 
-        return bin_indices
+        return bin_indices_t.transpose(0, 1).contiguous()
 
     def predict_binned(self, bin_indices):
         num_samples = bin_indices.size(0)
-        tree_tensor = torch.stack(
-            [
-                self.flatten_tree(tree, max_nodes=2 ** (self.max_depth + 1))
-                for tree in self.forest
-                if tree
-            ]
-        ).to(self.device)
+        tree_tensor = self._get_cached_regression_tree_tensor()
 
-        out = torch.zeros(num_samples, device=self.device) + self.base_prediction
-        _get_node_kernel().predict_forest(
-            bin_indices.contiguous(), tree_tensor.contiguous(), self.learning_rate, out
+        out = torch.full(
+            (num_samples,),
+            float(self.base_prediction),
+            device=self.device,
+            dtype=torch.float32,
         )
+        if tree_tensor.size(0) > 0:
+            _get_node_kernel().predict_forest(
+                bin_indices.contiguous(),
+                tree_tensor.contiguous(),
+                self.learning_rate,
+                out,
+            )
 
         return out
 
@@ -1263,11 +1366,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             is_prebinned = False
 
         if is_prebinned:
-            bin_indices = torch.empty(
-                X_np.shape, dtype=torch.int8, device="cuda"
-            )
-            for f in range(self.num_features):
-                bin_indices[:,f] = torch.as_tensor( X_np[:, f], device=self.device).contiguous()
+            bin_indices = torch.as_tensor(
+                X_np, device=self.device, dtype=torch.int8
+            ).contiguous()
         else:
             bin_indices = self.bin_data_with_existing_edges(X_np)
         return bin_indices
@@ -1324,24 +1425,22 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             if prior_k > 0:
                 F[:, k] = torch.log(torch.tensor(prior_k + 1e-10))
 
-        # Accumulate predictions from all trees
-        for round_trees in self.forest:
-            if not round_trees:  # Skip if empty
+        class_tree_tensors = self._get_cached_multiclass_tree_tensors()
+        bin_indices_contiguous = bin_indices.contiguous()
+
+        # Accumulate predictions from all trees, grouped by class
+        for class_k, tree_tensor in enumerate(class_tree_tensors):
+            if tree_tensor is None or tree_tensor.size(0) == 0:
                 continue
-            for k, tree in enumerate(round_trees):
-                # Get predictions for class k
-                tree_tensor = self.flatten_tree(tree, max_nodes=2 ** (self.max_depth + 1)).to(self.device)
-                tree_preds = torch.zeros(num_samples, device=self.device)
 
-                # Call predict kernel for this single tree
-                _get_node_kernel().predict_forest(
-                    bin_indices.contiguous(),
-                    tree_tensor.unsqueeze(0).contiguous(),  # Add batch dimension
-                    self.learning_rate,
-                    tree_preds,
-                )
-
-                F[:, k] += tree_preds
+            tree_preds = torch.zeros(num_samples, device=self.device)
+            _get_node_kernel().predict_forest(
+                bin_indices_contiguous,
+                tree_tensor.contiguous(),
+                self.learning_rate,
+                tree_preds,
+            )
+            F[:, class_k] += tree_preds
 
         # Convert logits to probabilities via softmax
         probs = softmax(F, dim=1)
@@ -1542,6 +1641,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.monotonic_constraints_vector_ is not None,
         )
         self.monotonic_required_split_direction_gpu_ = None
+        self._invalidate_prediction_cache()
 
         print(f"Model loaded from {path} ({self._trees_trained} trees)")
 
