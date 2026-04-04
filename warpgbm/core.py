@@ -768,9 +768,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 )
                 return bin_indices, era_indices, bin_edges, unique_eras, Y_gpu
 
-            print("Quantile binning...")
-            t = time.time()
-
             bin_edges = torch.empty(
                 (self.num_features, self.num_bins - 1),
                 dtype=torch.float32,
@@ -789,8 +786,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 _get_node_kernel().custom_cuda_binner(X_f, bin_edges_f, bin_indices_f)
                 bin_indices[:, f] = bin_indices_f
                 bin_edges[f, :] = bin_edges_f
-
-            print(f"Done binning in {time.time() - t:.2f} seconds.")
 
             unique_eras, era_indices = torch.unique(era_id_gpu, return_inverse=True)
             return bin_indices, era_indices, bin_edges, unique_eras, Y_gpu
