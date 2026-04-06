@@ -6,6 +6,13 @@
 
 WarpGBM is a high-performance, GPU-accelerated Gradient Boosted Decision Tree (GBDT) library engineered from silicon up with PyTorch and custom CUDA kernels. Built for speed demons and researchers who refuse to compromise.
 
+## Changes
+This version is a (allowed under the GNU GPL license) fork/modification of the original WarpGBM implementation (https://github.com/jefferythewind/warpgbm).
+In this version, we have made the following changes:
+- Added support for monotonic constraints
+- Added support for sample weights
+- Added support for multi-regression (vector targets)
+
 ## 🎯 What Sets WarpGBM Apart
 
 **Regression + Classification Unified**  
