@@ -79,9 +79,12 @@ WarpGBM.fit()
 
 **Python Layer** (`warpgbm/core.py`):
 - API interface
-- Training orchestration
-- Objective-specific logic
+- Training orchestration (one engine for all objectives)
 - Tree data structures
+
+**Objectives** (`warpgbm/objectives.py`, `warpgbm/losses.py`):
+- Built-in and custom loss functions (gradients/hessians on the GPU)
+- Helpers for dataset-level losses (correlation, MSE)
 
 **CUDA Layer** (`warpgbm/cuda/`):
 - `binner.cu`: Feature quantization
@@ -91,9 +94,7 @@ WarpGBM.fit()
 - `node_kernel.cpp`: Python bindings
 
 **Utilities** (`warpgbm/metrics.py`):
-- Loss functions
-- Evaluation metrics
-- Gradient computations
+- Evaluation metrics (weighted, NaN-aware for multi-output)
 
 ---
 
@@ -101,40 +102,40 @@ WarpGBM.fit()
 
 ```
 warpgbm/
-├── __init__.py              # Package exports
-├── core.py                  # Main WarpGBM class (1000+ lines)
-│   ├── __init__()           # Parameter validation
-│   ├── fit()                # Entry point for training
-│   ├── _fit_regression()    # Regression-specific training
-│   ├── _fit_classification()# Classification-specific training
-│   ├── grow_forest()        # Regression boosting loop
-│   ├── grow_forest_multiclass() # Classification boosting loop
-│   ├── grow_tree()          # Recursive tree building
-│   ├── predict()            # Main prediction interface
-│   ├── predict_proba()      # Classification probabilities
-│   └── [20+ helper methods]
+├── __init__.py              # Package exports (WarpGBM, Objective classes, losses)
+├── core.py                  # Main WarpGBM class: ONE training engine for all objectives
+│   ├── fit()                # validation → targets/weights/masks → ObjectiveContext → grow_forest()
+│   ├── grow_forest()        # boosting loop: objective.grad_hess → one vector tree or K per-output trees
+│   ├── _grow_single_tree()  # per-tree setup (fixed-point scales, monotone flag), leaf values fetched once
+│   ├── grow_tree()          # recursive splits, NaN routing, monotone bound propagation
+│   ├── find_best_split()    # split kernel + era (DES) agreement + monotone mask
+│   ├── compute_eval()       # incremental eval scores, built-in / callable metrics, early stopping
+│   ├── predict(), predict_raw(), predict_proba()
+│   └── save_model() / load_model()
 │
-├── metrics.py               # Loss functions and metrics
-│   ├── rmsle_torch()
-│   ├── softmax()
-│   ├── log_loss_torch()
-│   └── accuracy_torch()
+├── objectives.py            # Objective interface + built-ins
+│   ├── ObjectiveContext     # weight, mask, target_mask, era_index, num_outputs, iteration
+│   ├── Objective            # base class (grad_hess, loss, init_score, transform, output_strategy, ...)
+│   ├── SquaredError         # 'regression' / 'multi_regression'
+│   ├── Softmax              # 'multiclass' / 'binary' (per_output strategy)
+│   ├── GradHessObjective, AutogradObjective, DatasetLossObjective   # custom losses
+│   └── compute_grad_hess()  # applies weights + NaN-target masks, finiteness check
+│
+├── losses.py                # GPU helpers for dataset-level losses (pearson_corr, weighted_mse)
+├── metrics.py               # Evaluation metrics (weighted MSE / corr / RMSLE / logloss / accuracy)
 │
 └── cuda/
     ├── node_kernel.cpp      # Python/CUDA bridge
-    ├── binner.cu            # Quantile binning
-    ├── histogram_kernel.cu  # Histogram accumulation
-    ├── best_split_kernel.cu # Split finding (with DES)
-    └── predict.cu           # Tree traversal
+    ├── binner.cu            # Quantile binning (NaN -> dedicated bin)
+    ├── histogram_kernel.cu  # Deterministic fixed-point histograms [E,F,B,K] + count channel
+    ├── best_split_kernel.cu # Per-candidate gains (2 NaN directions), summed over outputs, DES directions
+    └── predict.cu           # Tree traversal (7-column flattened trees with NaN direction)
 
-tests/
-├── test_fit_predict_corr.py     # Basic regression
-├── test_invariant.py            # Era-splitting tests
-├── test_multiclass.py           # Classification suite
-├── numerai_test.py              # Real-world data
-├── numerai_invariant_test.py    # Era splitting + real data
-└── full_numerai_test.py         # Full dataset test
+docs/
+├── CUSTOM_OBJECTIVES.md     # Guide for custom / dataset-level losses
+└── FORK_CHANGES.md          # Review of fork changes, fixed bugs, behaviour changes
 
+tests/                       # see "Test Suite Overview" below
 examples/
 └── Spiral Dataset.ipynb     # OOD generalization demo
 ```
@@ -145,25 +146,21 @@ examples/
 
 ### 1. Objective Types
 
-WarpGBM supports three objectives:
+Every objective is an `Objective` (see `warpgbm/objectives.py` and `docs/CUSTOM_OBJECTIVES.md`)
+returning `grad = dL/dscore`, `hess = d²L/dscore²` on the GPU for raw scores `[N, K]`. The engine
+multiplies by sample weights, zeroes missing targets and grows trees on `-grad`
+(leaf = `Σ(-g) / (Σh + L2_reg)`).
 
-**Regression** (`objective='regression'`):
-- Output: Continuous values
-- Loss: MSE (mean squared error)
-- Gradients: `residual = y_true - y_pred`
-- Hessians: Constant (1.0)
+**Regression** (`objective='regression'` / `'multi_regression'` → `SquaredError`):
+- Gradients `pred - y`, hessians 1; init = weighted mean per output
+- Multi-output: one tree per round with K-dimensional leaves; gain summed over outputs
 
-**Binary Classification** (`objective='binary'`):
-- Output: Class labels {0, 1} + probabilities
-- Loss: Binary cross-entropy via softmax
-- Trees: 2 trees per round (one per class)
+**Binary / Multiclass** (`'binary'` / `'multiclass'` → `Softmax`, `output_strategy="per_output"`):
+- K trees per round (one per class), `g_k = p_k - y_k`, `h_k = p_k (1 - p_k)`
+- Init = weighted log class priors, stored in `base_prediction` and used at prediction
 
-**Multiclass** (`objective='multiclass'`):
-- Output: Class labels + K-dimensional probabilities
-- Loss: Categorical cross-entropy
-- Trees: K trees per round (one per class)
-- Gradients: `g_k = p_k - y_k` (softmax gradient)
-- Hessians: `h_k = p_k * (1 - p_k)` (diagonal approximation)
+**Custom**: an `Objective` subclass, `GradHessObjective`, `AutogradObjective`,
+`DatasetLossObjective` (dataset-level, e.g. Pearson correlation), or a callable `(y, pred, ctx) -> (grad, hess)`.
 
 ### 2. Directional Era-Splitting (DES)
 
@@ -189,31 +186,32 @@ Trees are stored as nested Python dictionaries:
 
 ```python
 {
-    'feature': 5,           # Which feature to split on
-    'bin': 3,               # Split threshold (in bin space)
+    'feature': 5,           # Which feature to split on (int)
+    'bin': 3,               # Split threshold (in bin space): bin <= 3 goes left
+    'nan_left': False,      # Learned direction of missing values (NaN bin)
     'left': {...},          # Left subtree (recursive)
     'right': {...}          # Right subtree (recursive)
 }
 
 # Leaf node:
 {
-    'leaf_value': 0.234,    # Prediction value
+    'leaf_value': 0.234,    # Prediction value (a list of K values for vector-leaf trees)
     'samples': 150          # Number of samples in leaf
 }
 ```
 
-**Multiclass**: `forest[round]` is a list of K trees (one per class).
+**per_output strategy (multiclass/binary)**: `forest[round]` is a list of K trees (one per class).
 
-**Regression**: `forest[round]` is a single tree.
+**vector strategy (regression, multi_regression, most custom objectives)**: `forest[round]` is a single tree.
 
 ### 4. Binning
 
 WarpGBM quantizes continuous features into discrete bins for histogram-based training.
 
 **Automatic Binning** (default):
-- Computes quantile-based bin edges per feature
-- Uses CUDA kernel for fast assignment
-- Stored in `self.bin_edges`
+- Computes quantile-based bin edges per feature (`torch.nanquantile`, NaNs excluded)
+- Uses CUDA kernel for fast assignment; NaN values go to the extra bin `num_bins` (`model.nan_bin`)
+- Stored in `self.bin_edges`; reused on warm start
 
 **Pre-binned Data**:
 - If input is integer with `max(X) < num_bins`, skips binning
@@ -222,29 +220,26 @@ WarpGBM quantizes continuous features into discrete bins for histogram-based tra
 ### 5. Histograms
 
 For each feature bin, accumulate:
-- Gradient sum: `G = Σ gradient_i`
-- Hessian sum: `H = Σ hessian_i`
+- Gradient sum per output: `G = Σ gradient_i`
+- Hessian sum per output: `H = Σ hessian_i`
+- Count channel: `C = Σ row_weight_i` (used for `min_child_weight`)
 
-**Shape**: `(num_eras, num_features, num_bins)`
+**Shapes**: `G, H: (num_eras, num_features, num_bins + 1, K)`, `C: (num_eras, num_features, num_bins + 1)`
 
-**CUDA Kernel**: `histogram_kernel.cu` parallelizes over samples.
+**CUDA Kernel**: `histogram_kernel.cu` parallelizes over (feature, row tile, output). Values are
+accumulated as fixed-point integers (deterministic); a global-memory fallback is used when the
+per-block histogram does not fit into shared memory (many eras).
+
+**Split candidates**: `2 * num_bins` per feature — every threshold with NaN going right
+(`c < num_bins`) and with NaN going left (`c >= num_bins`).
 
 **Subtraction Trick**: For left/right child, compute smaller histogram and subtract from parent.
 
 ### 6. Multiclass Implementation
 
-**Key Insight**: Train K independent trees per round using the SAME infrastructure as regression.
-
-**Per Round**:
-1. Compute softmax probabilities: `p = softmax(F)` where F is raw scores
-2. Compute gradients: `g[:,k] = p[:,k] - y_onehot[:,k]`
-3. Compute hessians: `h[:,k] = p[:,k] * (1 - p[:,k])`
-4. For class k:
-   - Set `self.residual = -g[:,k]`
-   - Call `grow_tree()` with `class_k` parameter
-   - Update `F[:,k]` (raw scores)
-
-**No CUDA Changes Needed**: Reuse histogram/split kernels by passing per-class g/h.
+`Softmax.output_strategy == "per_output"`: per round the engine computes `g, h` for all classes
+once and grows one tree per class on the column `(-g[:, k], h[:, k])`, updating only score column k.
+The same code path (`_grow_single_tree(..., score_col=k)`) serves any custom per-output objective.
 
 ### 7. Feature Importance
 
@@ -256,17 +251,13 @@ For each feature bin, accumulate:
 
 **Accumulation Logic** (in `grow_tree()`):
 ```python
-# When a split is accepted:
-global_feature_idx = self.feat_indices_tree[local_feature].item()
-per_era_gains = self.per_era_gain[:, local_feature, best_bin]  # [num_eras]
-
-for era_idx in range(self.num_eras):
-    self.per_era_feature_importance_[era_idx, global_feature_idx] += per_era_gains[era_idx].item()
+# When a split is accepted (accumulated on the GPU, copied once per fit):
+self._feature_importance_gpu[:, global_feature_idx] += self.per_era_gain[:, local_feature, best_candidate]
 ```
 
-**Aggregation** (after training):
+**Aggregation** (after training, in grow_forest()):
 ```python
-# In grow_forest() and grow_forest_multiclass():
+self.per_era_feature_importance_ += self._feature_importance_gpu.cpu().numpy()
 self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
 ```
 
@@ -313,41 +304,23 @@ model.n_estimators = 100
 model.fit(X, y)  # Adds 50 more trees (total: 100)
 ```
 
-### Critical Implementation Detail: Gradient Restoration
+### Critical Implementation Detail: Score Restoration
 
-**The Challenge**: When continuing training, we must restore `self.gradients` (the accumulated predictions) from the existing forest. Otherwise, new trees would be trained as if no previous trees exist.
+**The Challenge**: When continuing training, the raw scores `self.scores` `[N, K]` must be restored
+from the existing forest. Otherwise, new trees would be trained as if no previous trees exist.
 
-**Solution** (in `_fit_regression` and `_fit_classification`):
+**Solution** (in `fit()`): `self.scores = self._predict_raw_binned(self.bin_indices)`, i.e. the stored
+`base_prediction` plus all existing trees evaluated with the CUDA prediction kernel. The bin edges
+of the first fit are reused (`preprocess_gpu_data(..., reuse_edges=True)`).
 
-```python
-if self.warm_start and self._is_fitted and self._trees_trained > 0:
-    # Restore predictions from existing forest
-    self.gradients = torch.zeros_like(self.Y_gpu) + self.base_prediction
-    
-    # For regression: add predictions from each existing tree
-    for tree in self.forest[:self._trees_trained]:
-        if tree:
-            leaf_updates = self._compute_tree_predictions(tree, self.bin_indices)
-            self.gradients += leaf_updates
-    
-    # For classification: same but per-class
-    for round_trees in self.forest[:self._trees_trained]:
-        for class_k, tree in enumerate(round_trees):
-            if tree:
-                leaf_updates = self._compute_tree_predictions(tree, self.bin_indices)
-                self.gradients[:, class_k] += leaf_updates
-```
-
-**Helper Method**: `_compute_tree_predictions(tree, bin_indices)`
-- Traverses tree structure recursively
-- Assigns leaf values to samples based on splits
-- Returns tensor of predictions for all samples
+**Objective switching**: on warm start, `model.objective` may be replaced by a compatible objective
+(same `output_strategy`, classifier flag and K), e.g. MSE pre-training followed by a custom loss.
 
 ### Save/Load Implementation
 
 **save_model()**:
 - Pickles all model state (hyperparameters + trained state)
-- Includes: `forest`, `bin_edges`, `base_prediction`, `label_encoder`, feature importances, `_trees_trained`, etc.
+- Includes: `forest`, `objective_` (the Objective instance — custom classes must be importable), `bin_edges` and `base_prediction` (on CPU), `num_outputs`, `label_encoder`, feature importances, `_trees_trained`, etc.
 - Uses standard Python pickle (simple, portable)
 
 **load_model()**:
@@ -402,7 +375,7 @@ model.fit(X, y)
 - **Sklearn-compatible**: Matches sklearn's `warm_start` API
 - **No CUDA state saved**: Trees are Python dicts, no GPU tensors in checkpoint
 - **Backward compatible**: Default `warm_start=False` maintains existing behavior
-- **Works with all objectives**: Regression, binary, multiclass
+- **Works with all objectives**: Regression, multi-output regression, binary, multiclass and custom objectives (objectives can be switched on warm start if compatible)
 
 ---
 
@@ -462,7 +435,12 @@ pytest tests/ -v
 - `test_feature_importance.py`: Gain-based importance and per-era tracking
 - `test_random_state.py`: Reproducibility with random_state parameter
 - `test_warm_start.py`: Incremental training, save/load, and checkpointing
-- `test_numerai_minimal_v5.py`: Integration test (slow, requires download)
+- `test_sample_weight.py`, `test_monotonic_constraints.py`, `test_multi_regression.py`, `test_predict_chunking.py`: fork features
+- `test_custom_objective.py`: Objective subclasses, autograd, NaN targets, per-output strategy, warm start
+- `test_dataset_objective.py`: Dataset-level losses (multi-output Pearson), eras, objective switching
+- `test_nan_features.py`: NaN feature bin and learned default direction
+- `test_regressions.py`: Regression tests for the bugs listed in docs/FORK_CHANGES.md (incl. kernel vs reference, legacy pickles)
+- `numerai_test.py` / `full_numerai_test.py`: Integration scripts (slow, require download)
 
 **Important**: Always verify regression tests still pass when adding features!
 
@@ -480,75 +458,39 @@ pytest tests/ -v
 
 ### Example: Adding a New Objective
 
-Let's walk through adding a new objective type (e.g., Poisson regression):
+No engine changes are needed — implement an `Objective` (see `docs/CUSTOM_OBJECTIVES.md`):
 
-**1. Update validation**:
 ```python
-# In _validate_hyperparams()
-if kwargs["objective"] not in ["regression", "multiclass", "binary", "poisson"]:
-    raise ValueError(...)
+import torch
+from warpgbm import Objective, WarpGBM
+
+class Poisson(Objective):
+    name = "poisson"
+
+    def grad_hess(self, y, pred, ctx):          # pred = log-rate, [N, K]
+        rate = torch.exp(pred)
+        return rate - y, rate
+
+    def loss(self, y, pred, ctx):               # element-wise, used for logging / eval
+        return torch.exp(pred) - y * pred
+
+    def init_score(self, y, ctx):               # [K]
+        return torch.log((y * ctx.weight).sum(0) / ctx.weight.sum(0))
+
+    def transform(self, raw):                   # predict() returns the rate
+        return torch.exp(raw)
+
+model = WarpGBM(objective=Poisson()).fit(X, y)
 ```
 
-**2. Add gradient/hessian computation**:
-```python
-# In core.py or metrics.py
-def _compute_poisson_gradients_hessians(self, y_true):
-    """Compute gradients for Poisson loss"""
-    y_pred = torch.exp(self.gradients)
-    gradients = y_pred - y_true
-    hessians = y_pred
-    return gradients, hessians
-```
-
-**3. Add fit path**:
-```python
-# In fit()
-elif self.objective == "poisson":
-    return self._fit_poisson(X, y, era_id, ...)
-```
-
-**4. Implement training logic**:
-```python
-def _fit_poisson(self, X, y, ...):
-    # Similar to _fit_regression but with Poisson gradients
-    self.bin_indices, ... = self.preprocess_gpu_data(X, y, era_id)
-    # ... setup ...
-    with torch.no_grad():
-        self.grow_forest_poisson()  # Or reuse grow_forest()
-    return self
-```
-
-**5. Add metric**:
-```python
-# In metrics.py
-def poisson_loss_torch(y_true, y_pred):
-    return torch.mean(y_pred - y_true * torch.log(y_pred + 1e-8))
-```
-
-**6. Add tests**:
-```python
-# tests/test_poisson.py
-def test_poisson_regression():
-    X, y = make_poisson_data()
-    model = WarpGBM(objective='poisson', ...)
-    model.fit(X, y)
-    assert model.predict(X).mean() > 0
-```
+To make it a named built-in, add it to `resolve_objective()` in `objectives.py`, extend the
+string check in `_validate_hyperparams()`, and add tests.
 
 ### Adding New Metrics
 
-```python
-# 1. Add to metrics.py
-def my_custom_metric(y_true, y_pred):
-    return torch.mean(...)
-
-# 2. Update validation in core.py
-valid_metrics = ["mse", "corr", "rmsle", "logloss", "accuracy", "custom"]
-
-# 3. Add to get_eval_metric()
-if self.eval_metric == "custom":
-    return my_custom_metric(y_true, y_pred).item()
-```
+Pass a callable `metric(y_true, pred, weight, mask[, era]) -> float` (lower is better) as
+`eval_metric`, or add a string metric to `_metric_value()` in `core.py` (and to the metric lists at
+the top of the file).
 
 ### Adding New Regularization
 
@@ -651,29 +593,30 @@ X, y = make_blobs(n_samples=1000, centers=5, random_state=42)
 - Used: Once at fit time, once at predict time
 
 **2. Histogram** (`histogram_kernel.cu`):
-- Input: Binned data, gradients, hessians, sample indices, era indices
-- Output: Gradient/hessian sums per (era, feature, bin)
-- Parallelization: Block per feature, threads accumulate samples
+- Input: Binned data, gradients/hessians `[N, K]`, row weights, sample indices, era indices, fixed-point scales
+- Output: Gradient/hessian sums per (era, feature, bin, output) + row-weight count per (era, feature, bin)
+- Parallelization: Block per (feature, row tile, output); 32-bit fixed-point shared-memory accumulators flushed into 64-bit global accumulators → deterministic
+- Fallback: global-memory kernel when `3 * eras * bins * 4` bytes exceed shared memory
 - Used: Once per tree node (most expensive operation)
 
 **3. Split Finding** (`best_split_kernel.cu`):
 - Input: Histograms
-- Output: Per-era gains and split directions
-- Includes: DES logic (directional consistency check)
-- Parallelization: Thread per (feature, bin) pair
-- Used: Once per tree node
+- Output: Per-era gains and split directions for `2 * num_bins` candidates (both NaN directions)
+- Gain summed over outputs; direction only if all outputs agree; `min_child_weight` on the count channel, `min_sum_hessian` per output
+- Parallelization: Block per (feature, era), thread per candidate
+- Used: Once per tree node; the DES agreement / monotone masks are applied in `find_best_split()`
 
 **4. Prediction** (`predict.cu`):
-- Input: Binned data, flattened tree structures
-- Output: Predictions
+- Input: Binned data, flattened tree structures `[T, max_nodes, 7]` (col 6 = NaN direction)
+- Output: Predictions (one call per score column)
 - Parallelization: One thread per (sample, tree) pair
-- Used: At inference time
+- Used: At inference time and for incremental eval scores during training
 
 ### Memory Management
 
 **GPU Tensors** (stay on GPU throughout training):
 - `self.bin_indices`: Binned feature data
-- `self.gradients`: Current predictions (regression) or raw scores (classification)
+- `self.scores`: Current raw scores `[N, K]` (all objectives)
 - `self.Y_gpu`: Target labels
 - `self.era_indices`: Era assignments
 - Histograms (transient, recomputed per node)
@@ -702,37 +645,17 @@ X, y = make_blobs(n_samples=1000, centers=5, random_state=42)
 
 ## 🎨 Common Patterns
 
-### Pattern 1: Objective Branching
+### Pattern 1: No Objective Branching in the Engine
 
-When adding features that differ by objective:
+Objective-specific behaviour lives in `Objective` subclasses (`grad_hess`, `init_score`,
+`transform`, `prepare_targets`, `output_strategy`, `is_classifier`). The engine in `core.py` should
+stay objective-agnostic; only label encoding for classifiers and metric selection look at
+`objective_.is_classifier`.
 
-```python
-def fit(self, X, y, ...):
-    # Validate first
-    early_stopping_rounds = self.validate_fit_params(...)
-    
-    # Branch by objective
-    if self.objective in ["multiclass", "binary"]:
-        # Classification path
-        self.label_encoder = LabelEncoder()
-        y_encoded = self.label_encoder.fit_transform(y)
-        return self._fit_classification(X, y_encoded, ...)
-    else:
-        # Regression path (default)
-        return self._fit_regression(X, y, ...)
-```
+### Pattern 2: Multi-Output Is the General Case
 
-### Pattern 2: Reusing CUDA Kernels
-
-Don't modify CUDA kernels for new features. Instead:
-
-```python
-# For multiclass: call histogram kernel K times
-for class_k in range(self.num_classes):
-    self.residual = -grads[:, class_k]  # Set per-class gradients
-    hist_g, hist_h = self.compute_histograms(...)  # Reuse existing kernel
-    # ... process ...
-```
+Gradients, hessians, scores and histograms always carry an output dimension K (K = 1 for
+single-output regression). Write new engine features for `[N, K]` tensors.
 
 ### Pattern 3: Backward Compatibility
 
@@ -791,10 +714,11 @@ RuntimeError: shape '[5000]' is invalid for input of size 10000
 ```python
 print(f"X shape: {X.shape}")
 print(f"y shape: {y.shape}")
-print(f"gradients shape: {self.gradients.shape}")
+print(f"scores shape: {self.scores.shape}")   # always [N, K]
 ```
 
-**Common cause**: Forgot to handle 2D gradients for multiclass.
+**Common cause**: A custom objective returned grad/hess that do not broadcast to `[N, K]`
+(the engine raises a `ValueError` naming the shapes).
 
 **3. Label Encoding Issues**
 
@@ -867,7 +791,7 @@ pytest tests/test_fit_predict_corr.py -v
 **Medium Priority**:
 - [x] Monotonic constraints
 - [ ] Feature interaction constraints
-- [ ] Custom loss functions (user-defined gradients)
+- [x] Custom loss functions (user-defined gradients) — see docs/CUSTOM_OBJECTIVES.md
 - [ ] Learning rate scheduling
 
 **Research**:

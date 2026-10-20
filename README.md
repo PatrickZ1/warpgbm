@@ -9,9 +9,14 @@ WarpGBM is a high-performance, GPU-accelerated Gradient Boosted Decision Tree (G
 ## Changes
 This version is a (allowed under the GNU GPL license) fork/modification of the original WarpGBM implementation (https://github.com/jefferythewind/warpgbm).
 In this version, we have made the following changes:
-- Added support for monotonic constraints
-- Added support for sample weights
-- Added support for multi-regression (vector targets)
+- Added support for monotonic constraints (with value-bound propagation, also per output for multi-output models)
+- Added support for sample weights (1-D, or 2-D per output)
+- Added support for multi-regression (vector targets, NaN = missing target)
+- **Custom loss functions on the GPU**: per-sample (explicit grad/hess or autograd) and dataset-level losses (e.g. multi-output Pearson correlation), all working with weights, missing targets, eras, monotonic constraints and warm starts. See [docs/CUSTOM_OBJECTIVES.md](docs/CUSTOM_OBJECTIVES.md)
+- **Missing feature values**: NaN features get their own bin with a learned default direction
+- Deterministic training (fixed-point histograms), a global-memory fallback for many eras, and several bug fixes (multi-output split gain, `min_child_weight` with classification, class priors at prediction, weighted base score)
+
+A full review of all changes, the bugs that were fixed and the behaviour changes is in [docs/FORK_CHANGES.md](docs/FORK_CHANGES.md).
 
 ## 🎯 What Sets WarpGBM Apart
 
@@ -71,7 +76,9 @@ labels = model.predict(X_test)
 
 ### Core Engine
 - ⚡ **GPU-native CUDA kernels** for histogram building, split finding, binning, and prediction
-- 🎯 **Multi-objective support**: regression, binary, multiclass classification
+- 🎯 **Multi-objective support**: regression, multi-output regression, binary, multiclass classification
+- 🧩 **Custom objectives** — your own GPU loss (grad/hess, autograd, or dataset-level like correlation)
+- 🕳️ **Missing values** — NaN features get their own bin with a learned direction; NaN targets are masked
 - 📊 **Pre-binned data optimization** — skip binning if your data's already quantized
 - 🔥 **Mixed precision support** — `float32` or `int8` inputs
 - 🎲 **Stochastic features** — `colsample_bytree` for regularization
@@ -234,6 +241,45 @@ model.fit(X, y, era_id=era_labels)
 model.fit(X, y)
 ```
 
+### Missing Values
+
+NaN feature values are put into a dedicated bin. Every split learns whether missing values go left or
+right (`node["nan_left"]`), and missing values seen only at prediction time follow the right branch.
+NaN *targets* are treated as missing and ignored (per output for multi-output targets).
+
+```python
+X[some_rows, 3] = np.nan          # no imputation needed
+model = WarpGBM(objective='regression').fit(X, y)
+```
+
+### Custom Loss Functions (GPU)
+
+```python
+import torch
+from warpgbm import WarpGBM, Objective, AutogradObjective, DatasetLossObjective, losses
+
+# 1) explicit gradient / hessian
+class PseudoHuber(Objective):
+    def grad_hess(self, y, pred, ctx):
+        r = pred - y
+        s = 1 + r ** 2
+        return r / s.sqrt(), 1 / (s * s.sqrt())
+
+# 2) autograd (element-wise loss)
+log_cosh = AutogradObjective(lambda y, p: p - y + torch.nn.functional.softplus(-2 * (p - y)) - 0.693147)
+
+# 3) dataset-level loss: Pearson correlation over the full dataset, per output, + MSE for the scale
+def pearson_mse(y, pred, ctx):
+    corr = losses.pearson_corr(pred, y, weight=ctx.weight, mask=ctx.mask)   # [n_outputs]
+    return -corr.mean() + 0.1 * losses.weighted_mse(pred, y, weight=ctx.weight, mask=ctx.mask)
+
+model = WarpGBM(objective=DatasetLossObjective(pearson_mse), n_estimators=300)
+model.fit(X, Y, sample_weight=W, era_id=eras)     # Y may be multi-output and contain NaN
+```
+
+The engine applies sample weights, missing-target masks, era splitting, monotonic constraints and
+early stopping for you. See **[docs/CUSTOM_OBJECTIVES.md](docs/CUSTOM_OBJECTIVES.md)** for the full guide.
+
 ### Feature Importance: Understand Your Model
 
 ```python
@@ -381,13 +427,15 @@ This prevents overfitting to spurious correlations that only work in some time p
 
 ```python
 WarpGBM(
-    objective='regression',        # 'regression', 'binary', or 'multiclass'
-    num_bins=10,                   # Histogram bins for feature quantization
+    objective='regression',        # 'regression', 'multi_regression', 'binary', 'multiclass',
+                                   # an Objective instance, or a callable (y, pred, ctx) -> (grad, hess)
+    num_bins=10,                   # Histogram bins for feature quantization (+1 extra bin for NaN)
     max_depth=3,                   # Maximum tree depth
     learning_rate=0.1,             # Shrinkage rate (aka eta)
     n_estimators=100,              # Number of boosting rounds
-    min_child_weight=20,           # Min sum of instance weights in child node
+    min_child_weight=20,           # Min sum of sample weights in a child node (~ row count)
     min_split_gain=0.0,            # Min loss reduction to split
+    min_sum_hessian=1e-3,          # Min hessian sum per child for an output to contribute to the gain
     L2_reg=1e-6,                   # L2 leaf regularization
     colsample_bytree=1.0,          # Feature subsample ratio per tree
     random_state=None,             # Random seed for reproducibility
@@ -403,16 +451,19 @@ WarpGBM(
 
 ```python
 model.fit(
-    X,                              # Features: np.array shape (n_samples, n_features)
-    y,                              # Target: np.array shape (n_samples,)
+    X,                              # Features: np.array shape (n_samples, n_features), NaN allowed
+    y,                              # Target: (n_samples,) or (n_samples, n_outputs); NaN = missing target
     era_id=None,                    # Optional: era labels for invariant learning
-    sample_weight=None,             # Optional: per-sample training weights (strictly positive, auto-rescaled to mean=1)
+    sample_weight=None,             # Optional: (n_samples,) or (n_samples, n_outputs); auto-rescaled to mean=1
+                                    #   (strictly positive for 1-D targets, non-negative for 2-D targets)
     X_eval=None,                    # Optional: validation features
     y_eval=None,                    # Optional: validation targets
-    sample_weight_eval=None,        # Optional: per-sample eval weights (strictly positive, auto-rescaled to mean=1)
+    sample_weight_eval=None,        # Optional: eval weights (same rules as sample_weight)
     eval_every_n_trees=None,        # Eval frequency (in rounds)
     early_stopping_rounds=None,     # Stop if no improvement for N evals
-    eval_metric='mse'               # 'mse', 'rmsle', 'corr', 'logloss', 'accuracy'
+    eval_metric=None,               # None (objective default), 'mse', 'rmsle', 'corr', 'logloss', 'accuracy',
+                                    #   'loss' (objective's loss) or callable(y, pred, weight, mask[, era]) -> float
+    era_id_eval=None,               # Optional: eval-set eras (passed to era-aware metrics / losses)
 )
 ```
 
@@ -427,6 +478,9 @@ labels = model.predict(X)
 
 # Classification: returns class probabilities
 probabilities = model.predict_proba(X)  # shape: (n_samples, n_classes)
+
+# Raw scores before the objective's transform (e.g. logits)
+raw = model.predict_raw(X)
 
 # Feature importance: gain-based (like LightGBM/XGBoost)
 importances = model.get_feature_importance(normalize=True)  # sums to 1.0
@@ -499,7 +553,8 @@ pip install dist/warpgbm-*.whl
 - [ ] SHAP value computation on GPU
 - [ ] Feature interaction constraints
 - [x] Monotonic constraints
-- [ ] Custom loss functions
+- [x] Custom loss functions
+- [x] Missing value handling
 - [ ] Distributed training
 - [ ] ONNX export for deployment
 
@@ -513,7 +568,15 @@ Built on the shoulders of PyTorch, scikit-learn, LightGBM, XGBoost, and the CUDA
 
 ## 📝 Version History
 
-### v2.2.0 (Current)
+### v2.3.0 (Current)
+- 🧩 Custom objective API (`Objective`, `GradHessObjective`, `AutogradObjective`, `DatasetLossObjective`) and `warpgbm.losses`
+- 🕳️ NaN feature bin with learned default direction
+- 🎯 Multi-output regression, sample weights, monotonic constraints (with bound propagation)
+- 🔁 Deterministic fixed-point histograms; global-memory fallback for many eras
+- 🐛 Fixes: multi-output split gain, `min_child_weight` with classification, class priors at prediction, weighted base score
+- 📚 [docs/FORK_CHANGES.md](docs/FORK_CHANGES.md), [docs/CUSTOM_OBJECTIVES.md](docs/CUSTOM_OBJECTIVES.md)
+
+### v2.2.0
 - 💾 **Warm start support** for incremental training (closes #14)
 - 📦 `save_model()` and `load_model()` methods for checkpointing
 - 🔄 Resume training from saved models with `warm_start=True`
