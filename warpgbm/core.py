@@ -1,5 +1,6 @@
 import inspect
 import math
+from dataclasses import dataclass
 import torch
 import numpy as np
 import pickle
@@ -7,6 +8,7 @@ import importlib
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.preprocessing import LabelEncoder
 from warpgbm.metrics import (
+    Metric,
     weighted_multi_mse_torch,
     weighted_rmsle_torch,
     weighted_log_loss_torch,
@@ -15,7 +17,6 @@ from warpgbm.metrics import (
 )
 from warpgbm.objectives import (
     Objective,
-    ObjectiveContext,
     Softmax,
     PER_OUTPUT,
     VECTOR,
@@ -24,6 +25,21 @@ from warpgbm.objectives import (
     weighted_loss,
 )
 import gc
+
+
+@dataclass
+class _TargetWeights:
+    """Effective weights and masks of a target set (internal)."""
+
+    weight: torch.Tensor       # [N, K] normalized sample weight, 0 where the target is missing
+    mask: torch.Tensor         # [N, K] bool, score entry has an observed target
+    target_mask: torch.Tensor  # [N, T] bool, target entry is observed
+
+    @property
+    def row_weight(self) -> torch.Tensor:
+        """[N] mean effective weight per row."""
+        return self.weight.mean(dim=1)
+
 
 _NODE_KERNEL = None
 _NODE_KERNEL_IMPORT_ERROR = None
@@ -34,6 +50,7 @@ _NODE_WIDTH = 7
 _REGRESSION_METRICS = ["mse", "corr", "rmsle", "loss"]
 _MULTI_OUTPUT_METRICS = ["mse", "loss"]
 _CLASSIFICATION_METRICS = ["logloss", "accuracy", "loss"]
+_HIGHER_IS_BETTER = ("accuracy", "corr")
 
 
 def _get_node_kernel():
@@ -83,7 +100,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         warm_start=False,
         monotonic_constraints=None,
         min_sum_hessian=1e-3,
-        era_splitting=True,
     ):
         # Validate arguments
         self._validate_hyperparams(
@@ -100,7 +116,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             colsample_bytree=colsample_bytree,
             monotonic_constraints=monotonic_constraints,
             min_sum_hessian=min_sum_hessian,
-            era_splitting=era_splitting,
         )
 
         self.objective = objective
@@ -126,7 +141,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.min_child_weight = min_child_weight
         self.min_split_gain = min_split_gain
         self.min_sum_hessian = min_sum_hessian
-        self.era_splitting = era_splitting
         self.threads_per_block = threads_per_block
         self.rows_per_thread = rows_per_thread
         self.L2_reg = L2_reg
@@ -147,6 +161,11 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._trees_trained = 0  # Track number of trees already trained
         self._cached_tree_tensors = None
         self._cached_tree_key = None
+        self._objective_source = None
+        self._reset_eval_state()
+        self._per_era_importance_all = None
+        self._per_era_importance_best = None
+        self.train_predictions_ = None
 
     def _validate_hyperparams(self, **kwargs):
         # Validate objective
@@ -226,9 +245,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 f"Invalid colsample_bytree: {kwargs['colsample_bytree']}. Must be a float value > 0 and <= 1."
             )
 
-        if not isinstance(kwargs.get("era_splitting", True), bool):
-            raise TypeError("era_splitting must be a bool.")
-
         mc = kwargs.get("monotonic_constraints")
         if mc is not None and not isinstance(mc, (list, tuple, np.ndarray, dict)):
             raise TypeError(
@@ -295,33 +311,57 @@ class WarpGBM(BaseEstimator, RegressorMixin):
     # ─── Objective / shape helpers ───
 
     @property
+    def num_trees_(self):
+        """Number of trained boosting rounds (per_output models have K trees per round)."""
+        return self._trees_trained
+
+    @property
     def nan_bin(self):
         """Bin index reserved for missing (NaN) feature values."""
         return self.num_bins
 
     def _resolve_objective(self):
         if not (self.warm_start and self._is_fitted and self.objective_ is not None):
+            self._objective_source = self.objective
             return resolve_objective(self.objective)
 
-        old = self.objective_
-        unchanged = (
-            self.objective is old
-            or (isinstance(self.objective, str) and self.objective == old.name)
+        source = self._objective_source
+        unchanged = self.objective is source or (
+            isinstance(self.objective, str) and self.objective == source
         )
-        if unchanged:
-            return old
-
-        # Warm start with a different objective (e.g. MSE warm-up, then a custom loss):
-        # the raw score space and the forest layout must stay compatible.
-        new = resolve_objective(self.objective)
-        if new.output_strategy != old.output_strategy or new.is_classifier != old.is_classifier:
+        if not unchanged:
             raise ValueError(
-                f"Cannot warm-start {new!r} from a model trained with {old!r}: "
-                "output_strategy and is_classifier must match."
+                "The objective cannot be changed when continuing training with warm_start=True."
             )
-        if isinstance(new, Softmax) and isinstance(old, Softmax):
-            new.num_classes = old.num_classes
-        return new
+        return self.objective_
+
+    def _reset_eval_state(self):
+        self.best_iteration_ = None
+        self.best_score_ = None
+        self.evals_result_ = {"train": [], "eval": []}
+        self.eval_iterations_ = []
+        self.eval_loss = self.evals_result_["eval"]  # backward-compatible alias
+        self.eval_metric_name_ = None
+        self.eval_metric_higher_is_better_ = None
+        self._rollback = False
+
+    def _default_num_trees(self):
+        """Rounds used by default: the best round after early stopping, else all trained rounds."""
+        if self._rollback and self.best_iteration_ is not None:
+            return self.best_iteration_
+        return self._trees_trained
+
+    def _resolve_num_trees(self, num_trees):
+        if num_trees is None:
+            return self._default_num_trees()
+        if isinstance(num_trees, bool) or not isinstance(num_trees, (int, np.integer)):
+            raise TypeError(f"num_trees must be an int or None, got {num_trees!r}.")
+        if not 0 <= num_trees <= self._trees_trained:
+            raise ValueError(
+                f"num_trees must be between 0 and the number of trained rounds "
+                f"({self._trees_trained}), got {num_trees}."
+            )
+        return int(num_trees)
 
     def _is_classifier(self):
         obj = self.objective_
@@ -364,7 +404,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         eval_metric,
         sample_weight,
         sample_weight_eval,
-        era_id_eval=None,
+        eval_aux=None,
+        train_aux=None,
     ):
         obj = self.objective_
 
@@ -391,17 +432,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             raise ValueError(
                 "sample_weight_eval can only be used when X_eval and y_eval are provided."
             )
-        if era_id_eval is not None:
-            if X_eval is None or y_eval is None:
-                raise ValueError(
-                    "era_id_eval can only be used when X_eval and y_eval are provided."
-                )
-            if not isinstance(era_id_eval, np.ndarray) or era_id_eval.ndim != 1:
-                raise TypeError("era_id_eval must be a 1-dimensional numpy array.")
-            if len(era_id_eval) != X_eval.shape[0]:
-                raise ValueError(
-                    f"era_id_eval must have same length as y_eval. Got {len(era_id_eval)} and {X_eval.shape[0]}."
-                )
 
         # ─── Optional: era_id ───
         if era_id is not None:
@@ -465,6 +495,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 # No early stopping = set to "never trigger"
                 early_stopping_rounds = self.n_estimators + 1
 
+            if eval_aux is not None:
+                self._validate_aux(eval_aux, X_eval.shape[0], "eval_aux", "X_eval", eval_metric)
+
             if eval_metric is not None and not callable(eval_metric):
                 if obj.is_classifier:
                     valid_metrics = _CLASSIFICATION_METRICS + _REGRESSION_METRICS
@@ -481,7 +514,42 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                         f"eval_metric='loss' requires the objective {obj!r} to implement loss()."
                     )
 
+        if eval_aux is not None and (X_eval is None or y_eval is None):
+            raise ValueError("eval_aux can only be used when X_eval and y_eval are provided.")
+        if train_aux is not None:
+            if X_eval is None or y_eval is None:
+                raise ValueError("train_aux can only be used when X_eval and y_eval are provided.")
+            self._validate_aux(train_aux, X.shape[0], "train_aux", "X", eval_metric)
+
         return early_stopping_rounds  # May have been defaulted here
+
+    @staticmethod
+    def _aux_mode(metric):
+        """How a callable metric takes ``aux``: "required", "optional" or None (not accepted)."""
+        fn = metric.fn if isinstance(metric, Metric) else metric
+        try:
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return None
+        if "aux" in params:
+            return "optional" if params["aux"].default is not inspect.Parameter.empty else "required"
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return "optional"
+        return None
+
+    def _validate_aux(self, aux, n_rows, name, x_name, eval_metric):
+        if not isinstance(aux, np.ndarray) or aux.ndim not in (1, 2):
+            raise TypeError(f"{name} must be a 1- or 2-dimensional numpy array.")
+        if aux.shape[0] != n_rows:
+            raise ValueError(
+                f"{name} must have the same number of rows as {x_name}. Got {aux.shape[0]} and {n_rows}."
+            )
+        if not callable(eval_metric):
+            raise ValueError(f"{name} requires a callable eval_metric that accepts an `aux` argument.")
+        if self._aux_mode(eval_metric) is None:
+            raise ValueError(
+                f"{name} was given, but eval_metric does not accept an `aux` argument."
+            )
 
     def _validate_target_ndim(self, y, name):
         if self.objective == "multi_regression":
@@ -552,17 +620,16 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             raise ValueError("sample weights must have positive mean.")
         return weight_np / mean_w
 
-    def _build_context(self, y_prepared, sample_weight, era_index):
+    def _build_targets(self, y_prepared, sample_weight):
         """
-        Build GPU targets and the ObjectiveContext.
+        Build GPU targets with their effective weights and masks.
 
         Args:
             y_prepared: [N, T] float32 numpy targets, NaN/inf = missing.
             sample_weight: None, [N] or [N, T] numpy weights (already normalized).
-            era_index: [N] int32 tensor.
 
         Returns:
-            (Y_gpu [N, T] with missing entries filled with 0, ObjectiveContext)
+            (Y_gpu [N, T] with missing entries filled with 0, _TargetWeights)
         """
         n, t = y_prepared.shape
         K = self.num_outputs
@@ -589,14 +656,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 )
         weight = torch.where(mask, weight, torch.zeros((), device=self.device))
 
-        ctx = ObjectiveContext(
+        tw = _TargetWeights(
             weight=weight.to(torch.float32).contiguous(),
             mask=mask,
             target_mask=target_mask,
-            era_index=era_index,
-            num_outputs=K,
         )
-        return Y_gpu, ctx
+        return Y_gpu, tw
 
     # ─── Prediction cache ───
 
@@ -646,19 +711,19 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 tensors.append(None)
         return tensors
 
-    def _get_cached_tree_tensors(self):
+    def _get_cached_tree_tensors(self, num_trees):
         max_nodes = 2 ** (self.max_depth + 1)
         key = (
             str(self.device),
             max_nodes,
             self._output_strategy(),
-            self._trees_trained,
+            num_trees,
             self.num_outputs,
         )
         if self._cached_tree_tensors is not None and self._cached_tree_key == key:
             return self._cached_tree_tensors
 
-        rounds = self.forest[: self._trees_trained]
+        rounds = self.forest[:num_trees]
         tensors = self._flatten_groups(self._trees_per_output(rounds))
         self._cached_tree_tensors = tensors
         self._cached_tree_key = key
@@ -695,9 +760,13 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         eval_every_n_trees=None,
         early_stopping_rounds=None,
         eval_metric=None,
-        era_id_eval=None,
+        eval_aux=None,
+        train_aux=None,
     ):
         self.objective_ = self._resolve_objective()
+        has_eval_set = X_eval is not None and y_eval is not None
+        # Roll back to the best evaluated round only when early stopping was requested
+        rollback = has_eval_set and early_stopping_rounds is not None
 
         early_stopping_rounds = self.validate_fit_params(
             X,
@@ -710,7 +779,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             eval_metric,
             sample_weight,
             sample_weight_eval,
-            era_id_eval,
+            eval_aux,
+            train_aux,
         )
 
         if sample_weight is not None:
@@ -737,7 +807,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self._is_fitted = False
             self._trees_trained = 0
             self.training_loss = []
-            self.eval_loss = []
+            self._reset_eval_state()
+            self._per_era_importance_all = None
             self._invalidate_prediction_cache()
         else:
             # Continuing training: validate that data is compatible
@@ -749,6 +820,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 # Already have all requested trees
                 print(f"Model already has {self._trees_trained} trees (n_estimators={self.n_estimators}). No additional training needed.")
                 return self
+            # The best round is tracked per fit (over this fit's evaluations)
+            self.best_iteration_ = None
+            self.best_score_ = None
+        self._rollback = rollback
+        self._per_era_importance_best = None
+        self.train_predictions_ = None
 
         if era_id is None:
             era_id = np.ones(X.shape[0], dtype="int32")
@@ -777,20 +854,11 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.preprocess_gpu_data(X, era_id, reuse_edges=continuing)
         )
         self.num_samples, self.num_features = X.shape
-        # The objective always sees the eras (ctx.era_index, e.g. for per-era losses);
-        # directional era splitting in the trees can be switched off independently.
-        loss_era_index = self.era_indices.to(dtype=torch.int32)
-        if self.era_splitting:
-            self.num_eras = len(self.unique_eras)
-            self.era_indices = loss_era_index
-        else:
-            self.num_eras = 1
-            self.era_indices = torch.zeros_like(loss_era_index)
+        self.num_eras = len(self.unique_eras)
+        self.era_indices = self.era_indices.to(dtype=torch.int32)
 
-        self.Y_gpu, self.ctx = self._build_context(
-            y_prepared, sample_weight, loss_era_index
-        )
-        self.row_weight_gpu = self.ctx.row_weight.contiguous()
+        self.Y_gpu, self.tw = self._build_targets(y_prepared, sample_weight)
+        self.row_weight_gpu = self.tw.row_weight.contiguous()
         self._count_scale = self._fixed_point_scale(
             self.row_weight_gpu, self.threads_per_block * self.rows_per_thread
         )
@@ -805,7 +873,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 )
         else:
             base = torch.as_tensor(
-                self.objective_.init_score(self.Y_gpu, self.ctx),
+                self.objective_.init_score(self.Y_gpu, self.tw.weight),
                 dtype=torch.float32,
                 device=self.device,
             ).reshape(-1)
@@ -817,7 +885,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 )
             self._store_base_score(base)
 
-        self.scores = self._predict_raw_binned(self.bin_indices)
+        self.scores = self._predict_raw_binned(self.bin_indices, self._trees_trained)
+        self._best_train_scores = None
+        self._train_aux = self._aux_tensor(train_aux)
 
         self.root_node_indices = torch.arange(self.num_samples, device=self.device, dtype=torch.int32)
         self.feature_indices = torch.arange(self.num_features, device=self.device, dtype=torch.int32)
@@ -825,42 +895,48 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         # ─── Optional Eval Set ───
         if X_eval is not None and y_eval is not None:
             self.bin_indices_eval = self.bin_inference_data(X_eval)
-            if era_id_eval is None:
-                era_index_eval = torch.zeros(X_eval.shape[0], dtype=torch.int32, device=self.device)
-            else:
-                _, era_index_eval = torch.unique(
-                    torch.from_numpy(era_id_eval).to(self.device), return_inverse=True
-                )
-                era_index_eval = era_index_eval.to(torch.int32)
-            self.Y_gpu_eval, self.ctx_eval = self._build_context(
-                y_eval_prepared, sample_weight_eval, era_index_eval
+            self.Y_gpu_eval, self.tw_eval = self._build_targets(
+                y_eval_prepared, sample_weight_eval
             )
             self.eval_every_n_trees = eval_every_n_trees
             self.early_stopping_rounds = early_stopping_rounds
             self.eval_metric = self._resolve_eval_metric(eval_metric)
-            self._eval_scores = self._predict_raw_binned(self.bin_indices_eval)
+            self.eval_metric_name_ = self._metric_name(self.eval_metric)
+            self.eval_metric_higher_is_better_ = self._higher_is_better(self.eval_metric)
+            self._eval_aux = self._aux_tensor(eval_aux)
+            self._eval_scores = self._predict_raw_binned(self.bin_indices_eval, self._trees_trained)
         else:
             self.bin_indices_eval = None
             self.Y_gpu_eval = None
-            self.ctx_eval = None
+            self.tw_eval = None
             self.eval_every_n_trees = None
             self.early_stopping_rounds = None
+            self._eval_aux = None
             self._eval_scores = None
 
         # ─── Grow the forest ───
         with torch.no_grad():
             self.grow_forest()
 
+        # In-sample raw scores of the default model (best round when rolled back)
+        train_scores = self.scores
+        if self._default_num_trees() != self._trees_trained and self._best_train_scores is not None:
+            train_scores = self._best_train_scores
+        self.train_predictions_ = train_scores.cpu().numpy()
+
         # Release training buffers
         self.bin_indices = None
         self.Y_gpu = None
-        self.ctx = None
+        self.tw = None
         self.scores = None
         self.row_weight_gpu = None
         self.bin_indices_eval = None
         self.Y_gpu_eval = None
-        self.ctx_eval = None
+        self.tw_eval = None
         self._eval_scores = None
+        self._eval_aux = None
+        self._train_aux = None
+        self._best_train_scores = None
 
         gc.collect()
 
@@ -1128,9 +1204,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         # Track feature importance: accumulate per-era gains for the chosen feature
         global_feature_idx = self._feat_indices_cpu[local_feature]
-        self._feature_importance_gpu[:, global_feature_idx] += self.per_era_gain[
-            :, local_feature, best_candidate
-        ]  # [num_eras]
+        split_gain = self.per_era_gain[:, local_feature, best_candidate]  # [num_eras]
+        self._feature_importance_gpu[:, global_feature_idx] += split_gain
+        split_gain_total = split_gain.sum()
 
         split_mask = self._go_left(
             self.bin_indices[node_indices, global_feature_idx], best_bin, nan_left
@@ -1194,13 +1270,15 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             right_upper,
         )
 
-        return {
+        node = {
             "feature": global_feature_idx,
             "bin": best_bin,
             "nan_left": bool(nan_left),
             "left": left_child,
             "right": right_child,
         }
+        self._pending_gains.append((node, split_gain_total))
+        return node
 
     def _grow_single_tree(self, grad, hess, score_col=None):
         """Grow one tree on gradient channels grad/hess [N, Kc] (negative-gradient convention)."""
@@ -1214,6 +1292,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             np.any(self.monotonic_constraints_vector_[self._feat_indices_cpu])
         )
         self._pending_leaves = []
+        self._pending_gains = []
 
         rows_per_block = self.threads_per_block * self.rows_per_thread
         self._hist_scales = (
@@ -1245,26 +1324,39 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._tree_hess = None
         self._tree_grad_hess = None
 
-        values = torch.stack([v for _, v in self._pending_leaves]).cpu().tolist()
-        for (leaf, _), value in zip(self._pending_leaves, values):
-            leaf["leaf_value"] = value[0] if len(value) == 1 else value
+        # One device -> host transfer per tree: leaf values and split gains
+        leaf_values = torch.stack([v for _, v in self._pending_leaves])  # [L, Kc]
+        num_leaves, num_channels = leaf_values.shape
+        packed = [leaf_values.reshape(-1)]
+        if self._pending_gains:
+            packed.append(torch.stack([g for _, g in self._pending_gains]).to(leaf_values.dtype))
+        host = torch.cat(packed).cpu().tolist()
+        for j, (leaf, _) in enumerate(self._pending_leaves):
+            value = host[j * num_channels : (j + 1) * num_channels]
+            leaf["leaf_value"] = value[0] if num_channels == 1 else value
+        for (node, _), gain in zip(self._pending_gains, host[num_leaves * num_channels :]):
+            node["gain"] = gain
         self._pending_leaves = []
+        self._pending_gains = []
         return tree
 
     def grow_forest(self):
         """Gradient boosting loop shared by all objectives."""
-        # Warm start: preserve existing training state
-        if not hasattr(self, 'training_loss') or not self.warm_start or not self._is_fitted:
-            self.training_loss = []
-            self.eval_loss = []  # if eval set is given
-            self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
-        elif self.per_era_feature_importance_.shape != (self.num_eras, self.num_features):
+        # Per-era importance of the trees from earlier (warm-start) fits
+        shape = (self.num_eras, self.num_features)
+        base = np.zeros(shape, dtype=np.float32)
+        previous = self._per_era_importance_all
+        # Unknown for earlier trees (e.g. after truncate() to a round without a snapshot)
+        base_known = previous is not None or self._trees_trained == 0
+        if previous is not None and previous.shape == shape:
+            base += previous
+        elif previous is not None:
             # Warm start with a different era layout: keep the totals in a single row
-            totals = self.per_era_feature_importance_.sum(axis=0, keepdims=True)
-            self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
-            self.per_era_feature_importance_[0] = totals[0]
+            base[0] = previous.sum(axis=0)
 
         self.stop = False
+        self._evals_since_best = 0
+        self._best_importance_gpu = None
         strategy = self._output_strategy()
 
         if self.colsample_bytree < 1.0:
@@ -1291,8 +1383,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.forest.extend([{} for _ in range(self.n_estimators - len(self.forest))])
 
         for i in range(start_iter, self.n_estimators):
-            self.ctx.iteration = i
-            g, h = compute_grad_hess(self.objective_, self.Y_gpu, self.scores, self.ctx)
+            g, h = compute_grad_hess(
+                self.objective_, self.Y_gpu, self.scores, self.tw.weight, self.tw.mask
+            )
             # Trees are grown on the negative gradient: leaf = sum(-g) / (sum(h) + L2)
             neg_grad = -g
 
@@ -1322,11 +1415,15 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             if self.stop:
                 break
 
-        # Aggregate feature importance across eras
-        self.per_era_feature_importance_ += self._feature_importance_gpu.cpu().numpy()
+        # Per-era importance of all trees, and of the best round of this fit
+        if base_known:
+            self._per_era_importance_all = base + self._feature_importance_gpu.cpu().numpy()
+            if self._best_importance_gpu is not None:
+                self._per_era_importance_best = base + self._best_importance_gpu.cpu().numpy()
         self._feature_importance_gpu = None
-        self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
+        self._best_importance_gpu = None
         self._is_fitted = True
+        self._update_importance_attributes()
 
         if strategy == PER_OUTPUT:
             print(f"Finished training {self.objective_.name} forest. Total rounds: {self._trees_trained} ({self._trees_trained * self.num_outputs} trees)")
@@ -1335,52 +1432,66 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
     # ─── Evaluation ───
 
-    def _metric_value(self, metric, Y, raw, ctx):
-        """Evaluate a metric (lower is better) on raw scores raw [N, K]."""
+    @staticmethod
+    def _metric_name(metric):
+        if isinstance(metric, Metric):
+            return metric.name
+        return getattr(metric, "__name__", str(metric))
+
+    @staticmethod
+    def _higher_is_better(metric):
+        if isinstance(metric, Metric):
+            return metric.higher_is_better
+        return isinstance(metric, str) and metric in _HIGHER_IS_BETTER
+
+    def _aux_tensor(self, aux):
+        if aux is None:
+            return None
+        return torch.from_numpy(np.ascontiguousarray(aux, dtype=np.float32)).to(self.device)
+
+    def _metric_value(self, metric, Y, raw, tw, aux=None):
+        """Evaluate a metric on raw scores raw [N, K]; returns its natural value."""
         obj = self.objective_
         if metric == "loss":
-            return weighted_loss(obj, Y, raw, ctx)
+            return weighted_loss(obj, Y, raw, tw.weight, tw.mask)
 
         pred = obj.transform(raw)
-        target_weight = ctx.weight if ctx.weight.shape == ctx.target_mask.shape else ctx.row_weight[:, None]
+        target_weight = tw.weight if tw.weight.shape == tw.target_mask.shape else tw.row_weight[:, None]
 
         if callable(metric):
-            y_true, mask, weight = Y, ctx.target_mask, target_weight
+            y_true, mask, weight = Y, tw.target_mask, target_weight
             if obj.is_classifier:
                 y_true, mask, weight = Y[:, 0], mask[:, 0], weight[:, 0]
             elif self._targets_1d and pred.shape[1] == 1:
                 pred, y_true, mask, weight = pred[:, 0], Y[:, 0], mask[:, 0], weight[:, 0]
-            if self._metric_takes_era(metric):
-                return float(metric(y_true, pred, weight, mask, era=ctx.era_index))
+            if aux is not None:
+                return float(metric(y_true, pred, weight, mask, aux=aux))
             return float(metric(y_true, pred, weight, mask))
 
         if metric == "logloss":
-            return weighted_log_loss_torch(Y[:, 0], pred, sample_weight=ctx.row_weight).item()
+            return weighted_log_loss_torch(Y[:, 0], pred, sample_weight=tw.row_weight).item()
         if metric == "accuracy":
             labels = torch.argmax(pred, dim=1)
-            return 1.0 - weighted_accuracy_torch(Y[:, 0], labels, sample_weight=ctx.row_weight).item()
+            return weighted_accuracy_torch(Y[:, 0], labels, sample_weight=tw.row_weight).item()
         if metric == "mse":
             return weighted_multi_mse_torch(
-                Y, pred, sample_weight=target_weight, valid_mask=ctx.target_mask
+                Y, pred, sample_weight=target_weight, valid_mask=tw.target_mask
             ).item()
 
-        valid = ctx.target_mask[:, 0]
+        valid = tw.target_mask[:, 0]
         y_v, p_v, w_v = Y[valid, 0], pred[valid, 0], target_weight[valid, 0]
         if metric == "corr":
-            return weighted_corr_loss_torch(y_v, p_v, sample_weight=w_v).item()
+            return 1.0 - weighted_corr_loss_torch(y_v, p_v, sample_weight=w_v).item()
         if metric == "rmsle":
             return weighted_rmsle_torch(y_v, p_v, sample_weight=w_v).item()
         raise ValueError(f"Invalid eval_metric: {metric}.")
 
-    @staticmethod
-    def _metric_takes_era(metric):
-        try:
-            params = inspect.signature(metric).parameters.values()
-        except (TypeError, ValueError):
+    def _is_better(self, score, best):
+        if not math.isfinite(score):
             return False
-        return any(
-            p.name == "era" or p.kind == inspect.Parameter.VAR_KEYWORD for p in params
-        )
+        if best is None:
+            return True
+        return score > best if self.eval_metric_higher_is_better_ else score < best
 
     def _add_round_to_eval_scores(self, round_trees):
         """Incrementally add the newest round to the eval scores (avoids re-flattening the forest)."""
@@ -1396,24 +1507,47 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._add_round_to_eval_scores(round_trees)
 
         obj = self.objective_
-        train_metric = "loss" if obj.has_loss() else "mse"
-        train_loss = self._metric_value(train_metric, self.Y_gpu, self.scores, self.ctx)
+        loss_name = "loss" if obj.has_loss() else "mse"
+        train_loss = self._metric_value(loss_name, self.Y_gpu, self.scores, self.tw)
         self.training_loss.append(train_loss)
 
-        if i % self.eval_every_n_trees == 0:
-            eval_loss = self._metric_value(
-                self.eval_metric, self.Y_gpu_eval, self._eval_scores, self.ctx_eval
-            )
-            self.eval_loss.append(eval_loss)
+        # Evaluate every eval_every_n_trees rounds and always at the last round, so that the
+        # trees after the last regular checkpoint are not dropped by the rollback
+        if i % self.eval_every_n_trees != 0 and i != self.n_estimators - 1:
+            return
 
-            if len(self.eval_loss) > self.early_stopping_rounds:
-                if self.eval_loss[-(self.early_stopping_rounds+1)] < self.eval_loss[-1]:
-                    self.stop = True
+        metric = self.eval_metric
+        eval_score = self._metric_value(
+            metric, self.Y_gpu_eval, self._eval_scores, self.tw_eval, self._eval_aux
+        )
+        # The eval metric on the training set (skipped if it needs aux data we don't have)
+        train_score = None
+        if self._train_aux is not None or not (
+            callable(metric) and self._aux_mode(metric) == "required"
+        ):
+            train_score = self._metric_value(metric, self.Y_gpu, self.scores, self.tw, self._train_aux)
+            self.evals_result_["train"].append(train_score)
+        self.evals_result_["eval"].append(eval_score)
+        self.eval_iterations_.append(i + 1)
 
-            metric_name = getattr(self.eval_metric, "__name__", str(self.eval_metric))
-            print(
-                f"🌲 Tree {i+1}/{self.n_estimators} | Train {train_metric}: {train_loss:.6f} | Eval {metric_name}: {eval_loss:.6f}"
-            )
+        if self._is_better(eval_score, self.best_score_):
+            self.best_score_ = eval_score
+            self.best_iteration_ = i + 1
+            self._evals_since_best = 0
+            self._best_importance_gpu = self._feature_importance_gpu.clone()
+            if self._rollback:
+                self._best_train_scores = self.scores.clone()
+        else:
+            self._evals_since_best += 1
+            if self._evals_since_best >= self.early_stopping_rounds:
+                self.stop = True
+
+        name = self.eval_metric_name_
+        train_part = (
+            f"Train {name}: {train_score:.6f}" if train_score is not None
+            else f"Train {loss_name}: {train_loss:.6f}"
+        )
+        print(f"🌲 Tree {i+1}/{self.n_estimators} | {train_part} | Eval {name}: {eval_score:.6f}")
 
     # ─── Binning / prediction ───
 
@@ -1460,8 +1594,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             bin_indices = self.bin_data_with_existing_edges(X_np)
         return bin_indices
 
-    def _predict_raw_binned(self, bin_indices):
-        """Raw scores [N, K] for binned data."""
+    def _predict_raw_binned(self, bin_indices, num_trees=None):
+        """Raw scores [N, K] for binned data, using the first num_trees rounds (None: default model)."""
+        num_trees = self._resolve_num_trees(num_trees)
         num_samples = bin_indices.size(0)
         out = (
             torch.zeros(
@@ -1469,9 +1604,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             )
             + self._base_score_tensor()
         )
-        if self._trees_trained > 0:
+        if num_trees > 0:
             self._accumulate_tree_tensors(
-                bin_indices, self._get_cached_tree_tensors(), out
+                bin_indices, self._get_cached_tree_tensors(num_trees), out
             )
         return out
 
@@ -1479,49 +1614,59 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         if not self._is_fitted:
             raise ValueError("Model has not been fitted yet. Call fit() first.")
 
-    def predict_binned(self, bin_indices):
+    def predict_binned(self, bin_indices, num_trees=None):
         """Transformed predictions for binned data ([N] for single-output targets)."""
-        pred = self.objective_.transform(self._predict_raw_binned(bin_indices))
+        pred = self.objective_.transform(self._predict_raw_binned(bin_indices, num_trees))
         if not self.objective_.is_classifier and self._targets_1d and pred.shape[1] == 1:
             return pred[:, 0]
         return pred
 
-    def predict_raw(self, X_np):
+    def predict_raw(self, X_np, num_trees=None):
         """
         Raw (untransformed) scores, e.g. logits for classification.
+
+        num_trees: number of boosting rounds to use. None uses the default model, i.e.
+        best_iteration_ after early stopping and all trained rounds otherwise.
 
         Returns shape (n_samples,) for single-output regression-like models, else (n_samples, K).
         """
         self._check_fitted()
+        num_trees = self._resolve_num_trees(num_trees)
         bin_indices = self.bin_inference_data(X_np)
-        raw = self._predict_raw_binned(bin_indices).cpu().numpy()
+        raw = self._predict_raw_binned(bin_indices, num_trees).cpu().numpy()
         del bin_indices
         if not self.objective_.is_classifier and self._targets_1d and raw.shape[1] == 1:
             return raw.reshape(-1)
         return raw
 
-    def predict(self, X_np):
+    def predict(self, X_np, num_trees=None):
         """
         Predict on new data.
 
         For regression / custom objectives: returns objective.transform(raw scores)
         For classification: returns predicted class labels
+
+        num_trees: number of boosting rounds to use. None uses the default model, i.e.
+        best_iteration_ after early stopping and all trained rounds otherwise.
         """
         self._check_fitted()
+        num_trees = self._resolve_num_trees(num_trees)
         if self.objective_.is_classifier:
             # Classification: return class labels
-            probs = self.predict_proba(X_np)
+            probs = self.predict_proba(X_np, num_trees)
             class_indices = np.argmax(probs, axis=1)
             return self.label_encoder.inverse_transform(class_indices)
 
         bin_indices = self.bin_inference_data(X_np)
-        preds = self.predict_binned(bin_indices).cpu().numpy()
+        preds = self.predict_binned(bin_indices, num_trees).cpu().numpy()
         del bin_indices
         return preds
 
-    def predict_proba(self, X_np):
+    def predict_proba(self, X_np, num_trees=None):
         """
         Predict class probabilities (classification only).
+
+        num_trees: number of boosting rounds to use (None: default model, see predict).
 
         Returns:
             np.array of shape (n_samples, n_classes) with probabilities
@@ -1529,24 +1674,81 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         if not self._is_classifier():
             raise ValueError("predict_proba only available for classification objectives")
         self._check_fitted()
+        num_trees = self._resolve_num_trees(num_trees)
 
         bin_indices = self.bin_inference_data(X_np)
-        probs = self.predict_proba_binned(bin_indices).cpu().numpy()
+        probs = self.predict_proba_binned(bin_indices, num_trees).cpu().numpy()
         del bin_indices
         return probs
 
-    def predict_proba_binned(self, bin_indices):
+    def predict_proba_binned(self, bin_indices, num_trees=None):
         """
         Predict probabilities from pre-binned data (classification).
 
         Returns:
             torch.Tensor of shape (n_samples, n_classes) with probabilities
         """
-        return self.objective_.transform(self._predict_raw_binned(bin_indices))
+        return self.objective_.transform(self._predict_raw_binned(bin_indices, num_trees))
 
     # ─── Feature importance ───
 
-    def get_feature_importance(self, importance_type='gain', normalize=True):
+    def _split_nodes(self, num_trees):
+        """Yield every split node of the first num_trees rounds."""
+        for round_trees in self.forest[:num_trees]:
+            trees = round_trees if isinstance(round_trees, list) else [round_trees]
+            for tree in trees:
+                stack = [tree] if tree else []
+                while stack:
+                    node = stack.pop()
+                    if "leaf_value" in node:
+                        continue
+                    yield node
+                    stack.extend((node["left"], node["right"]))
+
+    def _total_importance(self, n):
+        """Summed (over eras) gain per feature of the first n rounds, unnormalized."""
+        totals = np.zeros(self.num_features, dtype=np.float64)
+        for node in self._split_nodes(n):
+            if "gain" not in node:
+                # Trees saved before split gains were stored: only the snapshots are known
+                era_importance = self._snapshot_importance(n)
+                if era_importance is None:
+                    raise ValueError(
+                        "This model was saved without per-split gains; feature importance is "
+                        "only available for all trained rounds."
+                    )
+                return era_importance.sum(axis=0)
+            totals[node["feature"]] += node["gain"]
+        return totals.astype(np.float32)
+
+    def _snapshot_importance(self, n):
+        """Per-era importance [E, F] for n rounds if a snapshot exists, else None."""
+        if n == self._trees_trained and self._per_era_importance_all is not None:
+            return self._per_era_importance_all
+        if n == self.best_iteration_ and self._per_era_importance_best is not None:
+            return self._per_era_importance_best
+        return None
+
+    def _per_era_importance(self, n):
+        era_importance = self._snapshot_importance(n)
+        if era_importance is not None:
+            return era_importance
+        if self._per_era_importance_all is not None and self._per_era_importance_all.shape[0] == 1:
+            return self._total_importance(n)[None, :]
+        raise ValueError(
+            "Per-era feature importance is only stored for all trained rounds "
+            f"({self._trees_trained}) and for best_iteration_ ({self.best_iteration_}); got num_trees={n}."
+        )
+
+    def _update_importance_attributes(self):
+        n = self._default_num_trees()
+        self.feature_importance_ = self._total_importance(n)
+        try:
+            self.per_era_feature_importance_ = self._per_era_importance(n)
+        except ValueError:
+            self.per_era_feature_importance_ = None
+
+    def get_feature_importance(self, importance_type='gain', normalize=True, num_trees=None):
         """
         Get feature importance scores.
 
@@ -1556,6 +1758,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             Type of importance. Currently only 'gain' is supported.
         normalize : bool, default=True
             If True, normalize importances to sum to 1.0
+        num_trees : int or None, default=None
+            Count the splits of the first num_trees rounds. None uses the default model
+            (best_iteration_ after early stopping, else all trained rounds).
 
         Returns:
         --------
@@ -1568,20 +1773,20 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         per-era importances. Use get_per_era_feature_importance() to
         see era-specific importances.
         """
-        if self.feature_importance_ is None:
+        if not self._is_fitted:
             raise ValueError("Model has not been fitted yet.")
 
         if importance_type != 'gain':
             raise ValueError(f"importance_type '{importance_type}' not supported. Use 'gain'.")
 
-        importance = self.feature_importance_.copy()
+        importance = self._total_importance(self._resolve_num_trees(num_trees)).copy()
 
         if normalize and importance.sum() > 0:
             importance = importance / importance.sum()
 
         return importance
 
-    def get_per_era_feature_importance(self, normalize=True):
+    def get_per_era_feature_importance(self, normalize=True, num_trees=None):
         """
         Get per-era feature importance scores.
 
@@ -1589,6 +1794,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         -----------
         normalize : bool, default=True
             If True, normalize importances within each era to sum to 1.0
+        num_trees : int or None, default=None
+            None uses the default model (best_iteration_ after early stopping, else all
+            trained rounds). Per-era importances are stored for all trained rounds and for
+            best_iteration_ only; other values raise (except with a single era).
 
         Returns:
         --------
@@ -1604,10 +1813,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         This allows you to see which features are invariant across eras vs
         which features are only important in specific eras.
         """
-        if self.per_era_feature_importance_ is None:
+        if not self._is_fitted:
             raise ValueError("Model has not been fitted yet.")
 
-        importance = self.per_era_feature_importance_.copy()
+        importance = self._per_era_importance(self._resolve_num_trees(num_trees)).copy()
 
         if normalize:
             for era_idx in range(importance.shape[0]):
@@ -1616,6 +1825,48 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                     importance[era_idx] /= era_sum
 
         return importance
+
+    def truncate(self, num_trees=None):
+        """
+        Drop all boosting rounds after ``num_trees`` (default: ``best_iteration_``).
+
+        Use this before continuing training with ``warm_start=True`` from the best round of an
+        early-stopped fit; without it, warm starts continue after all trained rounds.
+        Training/eval histories are kept as logs. Per-era importances survive only when
+        truncating to best_iteration_ (or with a single era).
+        """
+        self._check_fitted()
+        if num_trees is None:
+            if self.best_iteration_ is None:
+                raise ValueError("truncate() without num_trees needs best_iteration_ (fit with an eval set).")
+            num_trees = self.best_iteration_
+        n = self._resolve_num_trees(num_trees)
+        default_before = self._default_num_trees()
+
+        era_importance = self._snapshot_importance(n)
+        if era_importance is None and self._per_era_importance_all is not None \
+                and self._per_era_importance_all.shape[0] == 1:
+            era_importance = self._total_importance(n)[None, :]
+        self._per_era_importance_all = era_importance
+
+        if self._output_strategy() == PER_OUTPUT:
+            del self.forest[n:]
+        else:
+            for r in range(n, len(self.forest)):
+                self.forest[r] = {}
+        self._trees_trained = n
+        self._rollback = False
+        if self.best_iteration_ is not None and self.best_iteration_ > n:
+            self.best_iteration_ = None
+            self.best_score_ = None
+            self._per_era_importance_best = None
+        if n != default_before:
+            self.train_predictions_ = None
+
+        self._invalidate_prediction_cache()
+        self.feature_importance_ = self._total_importance(n)
+        self.per_era_feature_importance_ = era_importance
+        return self
 
     # ─── Persistence ───
 
@@ -1656,7 +1907,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             "min_child_weight": self.min_child_weight,
             "min_split_gain": self.min_split_gain,
             "min_sum_hessian": self.min_sum_hessian,
-            "era_splitting": self.era_splitting,
             "L2_reg": self.L2_reg,
             "colsample_bytree": self.colsample_bytree,
             "random_state": self.random_state,
@@ -1680,7 +1930,16 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             "training_loss": (
                 self.training_loss if hasattr(self, "training_loss") else []
             ),
-            "eval_loss": self.eval_loss if hasattr(self, "eval_loss") else [],
+            "eval_loss": self.eval_loss,
+            "evals_result_": self.evals_result_,
+            "eval_iterations_": self.eval_iterations_,
+            "eval_metric_name_": self.eval_metric_name_,
+            "eval_metric_higher_is_better_": self.eval_metric_higher_is_better_,
+            "best_iteration_": self.best_iteration_,
+            "best_score_": self.best_score_,
+            "_rollback": self._rollback,
+            "_per_era_importance_all": self._per_era_importance_all,
+            "_per_era_importance_best": self._per_era_importance_best,
             "monotonic_constraints_vector_": self.monotonic_constraints_vector_,
             "monotonic_required_split_direction_": self.monotonic_required_split_direction_,
             "_monotonic_constraints_fitted_": self._monotonic_constraints_fitted_,
@@ -1726,7 +1985,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.min_child_weight = state['min_child_weight']
         self.min_split_gain = state['min_split_gain']
         self.min_sum_hessian = state.get('min_sum_hessian', 1e-3)
-        self.era_splitting = state.get('era_splitting', True)
         self.L2_reg = state['L2_reg']
         self.colsample_bytree = state['colsample_bytree']
         self.random_state = state['random_state']
@@ -1759,12 +2017,28 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 base = float(base.item())
         self.base_prediction = base
 
-        self.feature_importance_ = state['feature_importance_']
-        self.per_era_feature_importance_ = state['per_era_feature_importance_']
         self._is_fitted = state['_is_fitted']
         self._trees_trained = state['_trees_trained']
+        self._objective_source = self.objective
         self.training_loss = state.get('training_loss', [])
-        self.eval_loss = state.get('eval_loss', [])
+        # Models saved before best-iteration tracking: all trees, no best round
+        self.evals_result_ = state.get(
+            "evals_result_", {"train": [], "eval": state.get("eval_loss", [])}
+        )
+        self.eval_loss = self.evals_result_["eval"]
+        self.eval_iterations_ = state.get("eval_iterations_", [])
+        self.eval_metric_name_ = state.get("eval_metric_name_")
+        self.eval_metric_higher_is_better_ = state.get("eval_metric_higher_is_better_")
+        self.best_iteration_ = state.get("best_iteration_")
+        self.best_score_ = state.get("best_score_")
+        self._rollback = state.get("_rollback", False)
+        self._per_era_importance_all = state.get(
+            "_per_era_importance_all", state['per_era_feature_importance_']
+        )
+        self._per_era_importance_best = state.get("_per_era_importance_best")
+        self.feature_importance_ = state['feature_importance_']
+        self.per_era_feature_importance_ = state['per_era_feature_importance_']
+        self.train_predictions_ = None
         self.monotonic_constraints_vector_ = state.get(
             "monotonic_constraints_vector_", None
         )

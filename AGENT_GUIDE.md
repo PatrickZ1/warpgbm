@@ -82,9 +82,8 @@ WarpGBM.fit()
 - Training orchestration (one engine for all objectives)
 - Tree data structures
 
-**Objectives** (`warpgbm/objectives.py`, `warpgbm/losses.py`):
-- Built-in and custom loss functions (gradients/hessians on the GPU)
-- Helpers for dataset-level losses (correlation, MSE)
+**Objectives** (`warpgbm/objectives.py`):
+- Built-in and custom per-sample loss functions (gradients/hessians on the GPU, autograd by default)
 
 **CUDA Layer** (`warpgbm/cuda/`):
 - `binner.cu`: Feature quantization
@@ -102,9 +101,9 @@ WarpGBM.fit()
 
 ```
 warpgbm/
-├── __init__.py              # Package exports (WarpGBM, Objective classes, losses)
+├── __init__.py              # Package exports (WarpGBM, Objective, CustomObjective)
 ├── core.py                  # Main WarpGBM class: ONE training engine for all objectives
-│   ├── fit()                # validation → targets/weights/masks → ObjectiveContext → grow_forest()
+│   ├── fit()                # validation → targets/weights/masks → grow_forest()
 │   ├── grow_forest()        # boosting loop: objective.grad_hess → one vector tree or K per-output trees
 │   ├── _grow_single_tree()  # per-tree setup (fixed-point scales, monotone flag), leaf values fetched once
 │   ├── grow_tree()          # recursive splits, NaN routing, monotone bound propagation
@@ -114,14 +113,13 @@ warpgbm/
 │   └── save_model() / load_model()
 │
 ├── objectives.py            # Objective interface + built-ins
-│   ├── ObjectiveContext     # weight, mask, target_mask, era_index, num_outputs, iteration
-│   ├── Objective            # base class (grad_hess, loss, init_score, transform, output_strategy, ...)
+│   ├── Objective            # base class (loss, grad_hess = autograd of loss, init_score, transform, output_strategy, ...)
 │   ├── SquaredError         # 'regression' / 'multi_regression'
 │   ├── Softmax              # 'multiclass' / 'binary' (per_output strategy)
-│   ├── GradHessObjective, AutogradObjective, DatasetLossObjective   # custom losses
+│   ├── CustomObjective      # custom loss from plain functions (loss_fn, optional grad_hess_fn, init_fn, ...)
+│   ├── autograd_grad_hess() # gradient + exact diagonal hessian of a per-sample loss
 │   └── compute_grad_hess()  # applies weights + NaN-target masks, finiteness check
 │
-├── losses.py                # GPU helpers for dataset-level losses (pearson_corr, standardize, weighted_mse)
 ├── metrics.py               # Evaluation metrics (weighted MSE / corr / RMSLE / logloss / accuracy)
 │
 └── cuda/
@@ -132,7 +130,7 @@ warpgbm/
     └── predict.cu           # Tree traversal (7-column flattened trees with NaN direction)
 
 docs/
-├── CUSTOM_OBJECTIVES.md     # Guide for custom / dataset-level losses
+├── CUSTOM_OBJECTIVES.md     # Guide for custom losses
 └── FORK_CHANGES.md          # Review of fork changes, fixed bugs, behaviour changes
 
 tests/                       # see "Test Suite Overview" below
@@ -159,8 +157,9 @@ multiplies by sample weights, zeroes missing targets and grows trees on `-grad`
 - K trees per round (one per class), `g_k = p_k - y_k`, `h_k = p_k (1 - p_k)`
 - Init = weighted log class priors, stored in `base_prediction` and used at prediction
 
-**Custom**: an `Objective` subclass, `GradHessObjective`, `AutogradObjective`,
-`DatasetLossObjective` (dataset-level, e.g. Pearson correlation), or a callable `(y, pred, ctx) -> (grad, hess)`.
+**Custom**: a per-sample loss function `(y, pred) -> loss`, a `CustomObjective(loss_fn, ...)`, or an
+`Objective` subclass. Gradients and the diagonal hessian come from autograd unless `grad_hess` is
+given; the engine applies weights and masks missing targets.
 
 ### 2. Directional Era-Splitting (DES)
 
@@ -309,12 +308,26 @@ model.fit(X, y)  # Adds 50 more trees (total: 100)
 **The Challenge**: When continuing training, the raw scores `self.scores` `[N, K]` must be restored
 from the existing forest. Otherwise, new trees would be trained as if no previous trees exist.
 
-**Solution** (in `fit()`): `self.scores = self._predict_raw_binned(self.bin_indices)`, i.e. the stored
+**Solution** (in `fit()`): `self.scores = self._predict_raw_binned(self.bin_indices, self._trees_trained)`, i.e. the stored
 `base_prediction` plus all existing trees evaluated with the CUDA prediction kernel. The bin edges
 of the first fit are reused (`preprocess_gpu_data(..., reuse_edges=True)`).
 
-**Objective switching**: on warm start, `model.objective` may be replaced by a compatible objective
-(same `output_strategy`, classifier flag and K), e.g. MSE pre-training followed by a custom loss.
+**Continuation point**: always after all trained rounds; `truncate()` drops the rounds after
+`best_iteration_` first if training should continue from the best round. The objective cannot
+change between warm-start fits (`_resolve_objective` raises).
+
+### Early Stopping, Best Iteration and `num_trees`
+
+- `compute_eval()` evaluates every `eval_every_n_trees` rounds and at the last round, records
+  `evals_result_` / `eval_iterations_` and the best round (`best_iteration_`, `best_score_`,
+  direction from `_HIGHER_IS_BETTER` or `Metric.higher_is_better`), and stops after
+  `early_stopping_rounds` evaluations without improvement.
+- `_rollback` (set when `early_stopping_rounds` was given) makes `_default_num_trees()` return
+  `best_iteration_`; every prediction / importance method resolves `num_trees=None` through it.
+  The tree-tensor cache is keyed on the number of rounds.
+- Each split node stores its total gain (`"gain"`), so summed importances are exact for any
+  prefix; per-era importances are snapshots (`_per_era_importance_all/_best`).
+- `train_predictions_` is a copy of the training scores at the best round (or the final scores).
 
 ### Save/Load Implementation
 
@@ -375,7 +388,7 @@ model.fit(X, y)
 - **Sklearn-compatible**: Matches sklearn's `warm_start` API
 - **No CUDA state saved**: Trees are Python dicts, no GPU tensors in checkpoint
 - **Backward compatible**: Default `warm_start=False` maintains existing behavior
-- **Works with all objectives**: Regression, multi-output regression, binary, multiclass and custom objectives (objectives can be switched on warm start if compatible)
+- **Works with all objectives**: Regression, multi-output regression, binary, multiclass and custom objectives (the objective must stay the same)
 
 ---
 
@@ -436,8 +449,8 @@ pytest tests/ -v
 - `test_random_state.py`: Reproducibility with random_state parameter
 - `test_warm_start.py`: Incremental training, save/load, and checkpointing
 - `test_sample_weight.py`, `test_monotonic_constraints.py`, `test_multi_regression.py`, `test_predict_chunking.py`: fork features
-- `test_custom_objective.py`: Objective subclasses, autograd, NaN targets, per-output strategy, warm start
-- `test_dataset_objective.py`: Dataset-level losses (multi-output Pearson), eras, objective switching
+- `test_custom_objective.py`: autograd and explicit objectives, multi-output, NaN targets, weights, per-output strategy, warm start
+- `test_early_stopping.py`: best iteration / rollback, metric direction, `num_trees`, importances, `eval_aux` / `train_aux`, `train_predictions_`, `truncate()`
 - `test_nan_features.py`: NaN feature bin and learned default direction
 - `test_regressions.py`: Regression tests for the bugs listed in docs/FORK_CHANGES.md (incl. kernel vs reference, legacy pickles)
 - `numerai_test.py` / `full_numerai_test.py`: Integration scripts (slow, require download)
@@ -467,15 +480,11 @@ from warpgbm import Objective, WarpGBM
 class Poisson(Objective):
     name = "poisson"
 
-    def grad_hess(self, y, pred, ctx):          # pred = log-rate, [N, K]
-        rate = torch.exp(pred)
-        return rate - y, rate
-
-    def loss(self, y, pred, ctx):               # element-wise, used for logging / eval
+    def loss(self, y, pred):                    # per sample, pred = log-rate [N, K]; autograd gives grad/hess
         return torch.exp(pred) - y * pred
 
-    def init_score(self, y, ctx):               # [K]
-        return torch.log((y * ctx.weight).sum(0) / ctx.weight.sum(0))
+    def init_score(self, y, weight):            # [K]; weight is [N, K], 0 for missing targets
+        return torch.log((y * weight).sum(0) / weight.sum(0))
 
     def transform(self, raw):                   # predict() returns the rate
         return torch.exp(raw)
@@ -488,9 +497,10 @@ string check in `_validate_hyperparams()`, and add tests.
 
 ### Adding New Metrics
 
-Pass a callable `metric(y_true, pred, weight, mask[, era]) -> float` (lower is better) as
-`eval_metric`, or add a string metric to `_metric_value()` in `core.py` (and to the metric lists at
-the top of the file).
+Pass a callable `metric(y_true, pred, weight, mask[, aux]) -> float` (minimized) or
+`Metric(fn, higher_is_better=True)` as `eval_metric`, or add a string metric to `_metric_value()`
+in `core.py` (and to the metric lists at the top of the file, plus `_HIGHER_IS_BETTER` if it is
+maximized). `_metric_value()` returns natural values.
 
 ### Adding New Regularization
 

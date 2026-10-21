@@ -12,8 +12,9 @@ In this version, we have made the following changes:
 - Added support for monotonic constraints (with value-bound propagation, also per output for multi-output models)
 - Added support for sample weights (1-D, or 2-D per output)
 - Added support for multi-regression (vector targets, NaN = missing target)
-- **Custom loss functions on the GPU**: per-sample (explicit grad/hess or autograd) and dataset-level losses (e.g. multi-output Pearson correlation), all working with weights, missing targets, eras, monotonic constraints and warm starts. See [docs/CUSTOM_OBJECTIVES.md](docs/CUSTOM_OBJECTIVES.md)
+- **Custom loss functions on the GPU**: write the per-sample loss as a torch expression; gradients and hessians come from autograd (or supply them explicitly). Works with multi-output targets, sample weights, missing targets, eras, monotonic constraints and warm starts. See [docs/CUSTOM_OBJECTIVES.md](docs/CUSTOM_OBJECTIVES.md)
 - **Missing feature values**: NaN features get their own bin with a learned default direction
+- **Early stopping with rollback**: the best evaluated round is recorded (`best_iteration_`, `best_score_`); predictions, feature importances and in-sample `train_predictions_` use the best model; higher-is-better metrics, custom metrics with per-row auxiliary data (`eval_aux` / `train_aux`)
 - Deterministic training (fixed-point histograms), a global-memory fallback for many eras, and several bug fixes (multi-output split gain, `min_child_weight` with classification, class priors at prediction, weighted base score)
 
 A full review of all changes, the bugs that were fixed and the behaviour changes is in [docs/FORK_CHANGES.md](docs/FORK_CHANGES.md).
@@ -77,7 +78,7 @@ labels = model.predict(X_test)
 ### Core Engine
 - ⚡ **GPU-native CUDA kernels** for histogram building, split finding, binning, and prediction
 - 🎯 **Multi-objective support**: regression, multi-output regression, binary, multiclass classification
-- 🧩 **Custom objectives** — your own GPU loss (grad/hess, autograd, or dataset-level like correlation)
+- 🧩 **Custom objectives** — your own GPU loss; gradients and hessians via autograd or explicit
 - 🕳️ **Missing values** — NaN features get their own bin with a learned direction; NaN targets are masked
 - 📊 **Pre-binned data optimization** — skip binning if your data's already quantized
 - 🔥 **Mixed precision support** — `float32` or `int8` inputs
@@ -90,7 +91,7 @@ labels = model.predict(X_test)
 - 🔍 **Feature importance** — gain-based importance with unique per-era tracking
 
 ### Training Utilities
-- ✅ **Early stopping** with validation sets
+- ✅ **Early stopping** with validation sets; rolls back to the best round (`best_iteration_`)
 - 📊 **Rich metrics**: MSE, RMSLE, correlation, log loss, accuracy
 - 🔍 **Progress tracking** with loss curves
 - 🎚️ **Regularization** — L2 leaf penalties, min split gain, min child weight
@@ -186,9 +187,45 @@ model.fit(
     eval_metric='logloss'
 )
 
-# Get probabilities or class predictions
+# Predictions use the best evaluated round (model.best_iteration_) after early stopping
 probs = model.predict_proba(X_val)  # shape: (n_samples, n_classes)
 labels = model.predict(X_val)        # class labels
+print(model.best_iteration_, model.best_score_)
+```
+
+Evaluation runs every `eval_every_n_trees` rounds and always at the last round. Training stops once
+`early_stopping_rounds` evaluations in a row did not improve on the best one, and the model then
+uses the trees up to `best_iteration_` (all trees are kept; `predict(X, num_trees=...)` selects any
+other prefix, `model.truncate()` drops the rest). Metrics where higher is better (`'accuracy'`,
+`'corr'`) are maximized.
+
+#### Custom metrics with auxiliary data
+
+A callable metric is minimized; wrap it in `Metric(fn, higher_is_better=True)` to maximize it.
+Per-row data that is not part of the targets reaches the metric through `aux`:
+
+```python
+import numpy as np, torch
+from warpgbm import WarpGBM, Metric
+
+# Train MSE on y / sigma, early-stop on Pearson(pred * sigma, raw y clipped at +-10 sigma)
+def comp_corr(y_true, pred, weight, mask, aux):      # GPU tensors; aux: [n_eval, 2]
+    y_raw, sigma = aux[:, 0], aux[:, 1]
+    a = pred * sigma
+    b = torch.clamp(y_raw, -10 * sigma, 10 * sigma)
+    a, b = a - a.mean(), b - b.mean()
+    return float((a * b).sum() / torch.sqrt((a * a).sum() * (b * b).sum()))
+
+model = WarpGBM(n_estimators=1000, learning_rate=0.05)
+model.fit(
+    X, y / sigma,
+    X_eval=X_val, y_eval=y_val / sigma_val,
+    eval_aux=np.column_stack([y_val, sigma_val]),   # (n_eval,) or (n_eval, A)
+    train_aux=np.column_stack([y, sigma]),          # optional: same metric on the training set
+    eval_metric=Metric(comp_corr, higher_is_better=True, name="comp_corr"),
+    eval_every_n_trees=10, early_stopping_rounds=20,
+)
+model.train_predictions_   # in-sample raw scores of the best model, (n_samples, n_outputs)
 ```
 
 ### Invariant Learning: Distribution-Robust Signals
@@ -256,29 +293,38 @@ model = WarpGBM(objective='regression').fit(X, y)
 
 ```python
 import torch
-from warpgbm import WarpGBM, Objective, AutogradObjective, DatasetLossObjective, losses
+from warpgbm import WarpGBM, Objective, CustomObjective
 
-# 1) explicit gradient / hessian
+# 1) a per-sample loss: gradient and hessian come from autograd
+def log_cosh(y, pred):                             # y, pred: [n_samples, n_outputs]
+    r = pred - y
+    return r + torch.nn.functional.softplus(-2 * r) - 0.693147
+
+model = WarpGBM(objective=log_cosh, n_estimators=300)
+
+# 2) with options: constant hessian, initial score, link function, one tree per output, ...
+q = 0.9
+pinball = CustomObjective(
+    loss_fn=lambda y, p: torch.maximum(q * (y - p), (q - 1) * (y - p)),
+    hessian="ones",
+    init_fn=lambda y, weight: torch.quantile(y[:, 0], q).reshape(1),
+)
+
+# 3) a reusable class, optionally with explicit derivatives
 class PseudoHuber(Objective):
-    def grad_hess(self, y, pred, ctx):
+    def loss(self, y, pred):
+        return torch.sqrt(1 + (pred - y) ** 2) - 1
+
+    def grad_hess(self, y, pred):                  # optional; default is autograd of loss
         r = pred - y
         s = 1 + r ** 2
         return r / s.sqrt(), 1 / (s * s.sqrt())
 
-# 2) autograd (element-wise loss)
-log_cosh = AutogradObjective(lambda y, p: p - y + torch.nn.functional.softplus(-2 * (p - y)) - 0.693147)
-
-# 3) dataset-level loss: Pearson correlation over the full dataset, per output, + MSE for the scale
-def pearson_mse(y, pred, ctx):
-    corr = losses.pearson_corr(pred, y, weight=ctx.weight, mask=ctx.mask)   # [n_outputs]
-    return -corr.mean() + 0.1 * losses.weighted_mse(pred, y, weight=ctx.weight, mask=ctx.mask)
-
-model = WarpGBM(objective=DatasetLossObjective(pearson_mse), n_estimators=300)
 model.fit(X, Y, sample_weight=W, era_id=eras)     # Y may be multi-output and contain NaN
 ```
 
 The engine applies sample weights, missing-target masks, era splitting, monotonic constraints and
-early stopping for you. See **[docs/CUSTOM_OBJECTIVES.md](docs/CUSTOM_OBJECTIVES.md)** for the full guide.
+early stopping for you; the loss is written without them. See **[docs/CUSTOM_OBJECTIVES.md](docs/CUSTOM_OBJECTIVES.md)** for the full guide.
 
 ### Feature Importance: Understand Your Model
 
@@ -428,7 +474,7 @@ This prevents overfitting to spurious correlations that only work in some time p
 ```python
 WarpGBM(
     objective='regression',        # 'regression', 'multi_regression', 'binary', 'multiclass',
-                                   # an Objective instance, or a callable (y, pred, ctx) -> (grad, hess)
+                                   # an Objective instance, or a per-sample loss function (y, pred) -> loss
     num_bins=10,                   # Histogram bins for feature quantization (+1 extra bin for NaN)
     max_depth=3,                   # Maximum tree depth
     learning_rate=0.1,             # Shrinkage rate (aka eta)
@@ -441,7 +487,6 @@ WarpGBM(
     random_state=None,             # Random seed for reproducibility
     warm_start=False,              # If True, continue training from existing trees
     monotonic_constraints=None,    # Optional: vector or dict {feature_idx: -1|0|1}
-    era_splitting=True,            # Use era_id for directional era splitting (False: eras only reach the objective)
     threads_per_block=64,          # CUDA block size (tune for your GPU)
     rows_per_thread=4,             # Rows processed per thread
     device='cuda'                  # 'cuda' or 'cpu' (GPU strongly recommended)
@@ -461,11 +506,20 @@ model.fit(
     y_eval=None,                    # Optional: validation targets
     sample_weight_eval=None,        # Optional: eval weights (same rules as sample_weight)
     eval_every_n_trees=None,        # Eval frequency (in rounds)
-    early_stopping_rounds=None,     # Stop if no improvement for N evals
+    early_stopping_rounds=None,     # Stop after N evals without improving on the best; then use best_iteration_
     eval_metric=None,               # None (objective default), 'mse', 'rmsle', 'corr', 'logloss', 'accuracy',
-                                    #   'loss' (objective's loss) or callable(y, pred, weight, mask[, era]) -> float
-    era_id_eval=None,               # Optional: eval-set eras (passed to era-aware metrics / losses)
+                                    #   'loss' (objective's loss), callable(y, pred, weight, mask[, aux]) -> float
+                                    #   (minimized) or Metric(fn, higher_is_better=True)
+    eval_aux=None,                  # Optional: (n_eval,) or (n_eval, A) per-row data passed to the metric as aux=
+    train_aux=None,                 # Optional: same for the training set (training metric)
 )
+```
+
+The last round is always evaluated. With `early_stopping_rounds`, predictions, feature importances
+and `train_predictions_` default to the best round; without it, an eval set only monitors
+(`best_iteration_` is still recorded, but all trees are used). A `warm_start` continuation appends
+after all trained rounds; call `model.truncate()` first to continue from the best round. The
+objective cannot change between warm-start fits.
 ```
 
 ### Prediction & Utility Methods
@@ -483,12 +537,20 @@ probabilities = model.predict_proba(X)  # shape: (n_samples, n_classes)
 # Raw scores before the objective's transform (e.g. logits)
 raw = model.predict_raw(X)
 
-# Feature importance: gain-based (like LightGBM/XGBoost)
+# All prediction methods take num_trees (boosting rounds); None = default model
+# (best_iteration_ after early stopping, else all trained rounds)
+all_trees = model.predict(X, num_trees=model.num_trees_)
+
+# Feature importance: gain-based (like LightGBM/XGBoost), of the default model
 importances = model.get_feature_importance(normalize=True)  # sums to 1.0
 raw_gains = model.get_feature_importance(normalize=False)   # raw gain values
+first_100 = model.get_feature_importance(num_trees=100)      # any prefix of rounds
 
-# Per-era importance (when era_id was used in training)
+# Per-era importance (when era_id was used in training); stored for the best round and all rounds
 per_era_imp = model.get_per_era_feature_importance(normalize=True)  # shape: (n_eras, n_features)
+
+# Drop the rounds after best_iteration_ (or after num_trees)
+model.truncate()
 
 # Save and load models
 model.save_model('checkpoint.pkl')  # Saves all model state
@@ -502,10 +564,16 @@ model_loaded.load_model('checkpoint.pkl')  # Restores everything
 model.classes_                    # Unique class labels (classification only)
 model.num_classes                 # Number of classes (classification only)
 model.forest                      # Trained tree structures
-model.training_loss               # Training loss history
-model.eval_loss                   # Validation loss history (if eval set provided)
-model.feature_importance_         # Feature importance (sum across eras)
-model.per_era_feature_importance_ # Per-era feature importance (when era_id used)
+model.training_loss               # Training loss (objective loss) per round, if an eval set was given
+model.evals_result_               # {"train": [...], "eval": [...]} eval metric per checkpoint (natural values)
+model.eval_iterations_            # Round count of every checkpoint
+model.eval_loss                   # Alias of evals_result_["eval"]
+model.num_trees_                  # Number of trained boosting rounds
+model.best_iteration_             # Number of rounds of the best evaluated model (None without eval set)
+model.best_score_                 # Eval metric value at best_iteration_
+model.train_predictions_          # In-sample raw scores of the default model, (n_samples, n_outputs); not saved
+model.feature_importance_         # Feature importance of the default model (sum across eras)
+model.per_era_feature_importance_ # Per-era feature importance of the default model (when era_id used)
 ```
 
 ---
@@ -569,12 +637,18 @@ Built on the shoulders of PyTorch, scikit-learn, LightGBM, XGBoost, and the CUDA
 
 ## 📝 Version History
 
-### v2.3.0 (Current)
-- 🧩 Custom objective API (`Objective`, `GradHessObjective`, `AutogradObjective`, `DatasetLossObjective`) and `warpgbm.losses`
+### v2.4.0 (Current)
+- ⏪ Early stopping rolls back to the best round: `best_iteration_`, `best_score_`, `evals_result_`; `predict(..., num_trees=)`, `truncate()`
+- 🔍 Feature importances follow the used trees (`num_trees=`; per-era at the best round and all rounds)
+- 📏 `Metric(fn, higher_is_better=True)`; `accuracy` / `corr` are maximized and reported as natural values; per-row `eval_aux` / `train_aux` for callable metrics
+- 🎯 `train_predictions_`: in-sample predictions of the final model
+- ⚠️ The objective can no longer change between warm-start fits
+
+### v2.3.0
+- 🧩 Custom objective API (`Objective`, `CustomObjective`, or a plain loss function; autograd gradients and hessians)
 - 🕳️ NaN feature bin with learned default direction
 - 🎯 Multi-output regression, sample weights, monotonic constraints (with bound propagation)
 - 🔁 Deterministic fixed-point histograms and prediction; global-memory fallback for many eras
-- 📈 Correlation losses: standardized warm-up targets, `era_splitting=False` for per-era losses without DES
 - 🐛 Fixes: multi-output split gain, `min_child_weight` with classification, class priors at prediction, weighted base score
 - 📚 [docs/FORK_CHANGES.md](docs/FORK_CHANGES.md), [docs/CUSTOM_OBJECTIVES.md](docs/CUSTOM_OBJECTIVES.md)
 

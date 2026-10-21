@@ -47,7 +47,7 @@ for H).
 | **E** | Weighted regression `base_prediction` was the unweighted mean | `46a90db` | **0.008 → 0.672** (weighted mean 0.672) | weighted, masked mean in `SquaredError.init_score` |
 | **F** | Classification trained from log class priors, but `predict_proba` started from log(1/K) | upstream | binary at 10 % positives: mean p **0.50 → 0.106** | the initial scores (weighted log priors) are stored in `base_prediction` and used at prediction |
 | **G** | The histogram kernel needs 2·E·B floats of shared memory. Above 48 KB (≈ >190 eras at 32 bins) the launch failed, which was only `printf`'d, and training silently used empty histograms | upstream | 400 eras: MSE **1.009 → 0.274** | automatic global-memory fallback kernel; all CUDA launch errors now raise (`TORCH_CHECK`) |
-| **H** | A single NaN in a feature made all its quantile edges NaN, so the feature became useless | upstream | edges `[nan, …]` → finite; train MSE 9.12 → 0.84 (var 9.37) | NaN feature bin (see §3.2) |
+| **H** | A single NaN in a feature made all its quantile edges NaN, so the feature became useless | upstream | edges `[nan, …]` → finite; train MSE 9.12 → 0.84 (var 9.37) | NaN feature bin (see §3.3) |
 
 Smaller issues fixed along the way:
 
@@ -55,7 +55,7 @@ Smaller issues fixed along the way:
   and exact ties (common in round 0 of softmax, where every row has the same probability) were
   then broken randomly. `test_random_state_multiclass` failed ~40 % of the time once Bug A was
   fixed (the old code passed only because it hardly split). The fix is deterministic
-  fixed-point histograms (§3.3); 8/8 repeated fits now give identical forests.
+  fixed-point histograms (§3.4); 8/8 repeated fits now give identical forests.
 * Warm start used to **recompute bin edges** from the new data, which silently changed what the
   stored split bins mean. The edges of the first fit are now reused.
 * `save_model` pickled CUDA tensors (bin edges, base score); they are now stored on the CPU and
@@ -73,38 +73,58 @@ Smaller issues fixed along the way:
 ### 3.1 Unified objective engine and custom loss functions
 
 `warpgbm/objectives.py` defines the `Objective` interface (GPU tensors, `grad = dL/dscore`,
-`hess = d²L/dscore²`, `ObjectiveContext` with weights, masks, eras and the round index).
-**All** objectives, built-in and custom, run through a single training loop in `core.py`. This
-replaces the three previous copies (`_fit_regression`, `_fit_multi_regression`,
-`_fit_classification` and their `grow_forest*` / `compute_eval*` twins):
+`hess = d²L/dscore²`). **All** objectives, built-in and custom, run through a single training
+loop in `core.py`. This replaces the three previous copies (`_fit_regression`,
+`_fit_multi_regression`, `_fit_classification` and their `grow_forest*` / `compute_eval*` twins):
 
 * built-ins: `SquaredError` (`"regression"`, `"multi_regression"`) and `Softmax`
   (`"multiclass"`, `"binary"`);
-* custom: subclass `Objective`, `GradHessObjective(fn)`, `AutogradObjective(loss_fn)` (autograd
-  gradient + diagonal hessian), or a plain callable `(y, pred, ctx) -> (grad, hess)`;
-* dataset-level losses: `DatasetLossObjective(loss_fn)`, e.g. multi-output Pearson correlation
-  over the full dataset plus an MSE term, with NaN targets, 2-D weights and era splitting. It
-  provides gradient rescaling, an `"auto"` curvature estimate (absolute value, so negative
-  curvature still gives a descent step) and a squared-error warm-up (`warmup_rounds`, default 10;
-  `warmup_target="raw" | "standardized" | "era_standardized"`), because correlations are
-  undefined at constant predictions. The correlation math, its assumptions and a comparison with
-  MSE are in `docs/CUSTOM_OBJECTIVES.md` §3;
-* `warpgbm/losses.py`: GPU helpers `pearson_corr` (weighted, masked, per output, optionally per
-  group/era, groups weighted by weight or equally), `standardize` and `weighted_mse`;
-* `WarpGBM(era_splitting=False)`: the objective still receives the eras (`ctx.era_index`, e.g.
-  for a per-era correlation loss), but splits are found on pooled histograms without DES;
+* custom losses are **per-sample** torch expressions `loss(y, pred)` returning `[N, K]` or `[N]`.
+  Gradients and the exact diagonal hessian come from autograd (one extra backward pass per
+  output). Pass the function directly (`WarpGBM(objective=loss)`), wrap it in
+  `CustomObjective(loss_fn, grad_hess_fn=None, hessian="autograd"|"ones", min_hessian, init_fn,
+  transform_fn, output_strategy)`, or subclass `Objective` and implement `loss` and/or
+  `grad_hess`;
+* the engine applies sample weights (`[N]` or `[N, K]`) and masks missing targets, so custom
+  losses contain neither;
 * `output_strategy="vector"` (one tree per round with K-dimensional leaves) or `"per_output"`
   (K trees per round);
-* objective switching on warm start (e.g. MSE pre-training, then a custom loss);
-* `fit(..., eval_metric=callable)` with an optional `era` argument, `fit(..., era_id_eval=...)`,
-  `eval_metric=None` (objective default) and `"loss"` (the objective's own loss);
+* `fit(..., eval_metric=callable)` with signature `(y_true, pred, weight, mask) -> float`,
+  `eval_metric=None` (objective default) and `"loss"` (weighted mean of the objective's loss);
 * `predict_raw(X)` returns the untransformed scores (logits for classification).
 
 The forest storage formats are unchanged: scalar leaves for single output, list leaves for vector
 trees, a list of K trees per round for `per_output`. Models saved by the previous version still
 load (tested).
 
-### 3.2 NaN features get their own bin
+### 3.2 Early stopping with rollback, metric direction and auxiliary data
+
+* **Best iteration.** Every evaluation (every `eval_every_n_trees` rounds and at the last round)
+  is recorded in `evals_result_` (`"train"` / `"eval"`) and `eval_iterations_`; `best_iteration_`
+  (rounds, 1-based) and `best_score_` hold the best one. With `early_stopping_rounds`, training
+  stops after that many evaluations without improvement and the **default model is the best
+  round**: `predict` / `predict_raw` / `predict_proba` / importances / `train_predictions_` use
+  the first `best_iteration_` rounds. Before, all trees up to the stop were used (the hedge project
+  worked around this by setting `_trees_trained`).
+* **`num_trees=`** on all prediction and importance methods selects any prefix of rounds;
+  `truncate(num_trees=None)` drops the rounds after `best_iteration_`; `num_trees_` is the number
+  of trained rounds.
+* **Importances follow the used trees.** Each split node stores its total gain, so
+  `get_feature_importance(num_trees=n)` is exact for any `n`. Per-era importances are stored as
+  snapshots at `best_iteration_` and at all rounds.
+* **Metric direction.** `"accuracy"` and `"corr"` are maximized and reported as natural values
+  (before: `1 - accuracy`, `1 - corr`); callables are minimized unless wrapped in
+  `Metric(fn, higher_is_better=True, name=...)`.
+* **Auxiliary per-row data.** `fit(..., eval_aux=..., train_aux=...)` passes `[n]` / `[n, A]`
+  arrays to a callable metric as `aux=`, e.g. raw targets and scales for a competition metric
+  when the model trains on scaled targets. The eval metric is also computed on the training set
+  (`evals_result_["train"]`), unless it requires `aux` and no `train_aux` was given.
+* **`train_predictions_`**: in-sample raw scores of the default model, `[n_samples, n_outputs]`,
+  taken from the engine's training scores (no second predict pass).
+* Persistence: `save_model` keeps `best_iteration_`, `best_score_`, the eval history and the
+  importance snapshots; older pickles load as "all trees, no best round".
+
+### 3.3 NaN features get their own bin
 
 * Bin edges are computed with `torch.nanquantile`; NaN values map to a dedicated bin
   `num_bins` (histograms have `num_bins + 1` bins; `num_bins ≤ 127` still fits int8).
@@ -117,7 +137,7 @@ load (tested).
   tie-breaking and the resulting trees are the same as before. A NaN that appears only at
   predict time follows the right branch, like `+inf`.
 
-### 3.3 Deterministic, faster histogram kernel
+### 3.4 Deterministic, faster histogram kernel
 
 * Gradients, hessians and row weights are accumulated as fixed-point integers with a power-of-two
   scale per tree (32-bit in shared memory, 64-bit in global memory), then converted back to
@@ -132,7 +152,7 @@ load (tested).
   importance is accumulated on the GPU, and the monotone check is skipped on the host when the
   tree has no constrained feature.
 
-### 3.4 Other
+### 3.5 Other
 
 * The prediction kernel sums the trees of a sample in a fixed order (one thread per sample)
   instead of using float `atomicAdd` across trees. Repeated `predict` calls are now
@@ -153,7 +173,10 @@ load (tested).
 | multiclass / binary prediction | started from log(1/K) | starts from the stored training priors. Old pickles without a stored prior keep the old behaviour |
 | `fit(eval_metric=...)` default | `"mse"` | `None`, meaning the objective default (`"mse"` for regression, `"logloss"` for classification, `"loss"` for custom objectives) |
 | `num_outputs` | `None` for classifiers | K (number of classes) for every model |
-| warm start | recomputed bin edges | reuses the first fit's bin edges |
+| warm start | recomputed bin edges | reuses the first fit's bin edges; the objective cannot change between warm-start fits |
+| early stopping | stop when the value `r` evals back beats the latest one; all trees kept and used | stop after `r` evals without improving on the best; predictions / importances use `best_iteration_`; the last round is always evaluated |
+| `eval_loss` for `accuracy` / `corr` | `1 - accuracy`, `1 - corr` | natural values (maximized) |
+| `feature_importance_`, `per_era_feature_importance_` | all trained trees | the default model (best round after early stopping) |
 | tree nodes | `"feature"` was a 0-d CUDA tensor | Python int, plus a `"nan_left"` flag |
 | `predict` | float atomics over trees (last-bit noise between calls) | deterministic summation order |
 | CUDA API (`node_kernel`) | — | changed signatures: histogram (K channels, count, fixed-point scales), split (`[E,F,B,K]`, count, `min_sum_hessian`, 2·B candidates), binner (`nan_bin`), predict (`nan_bin`, 7-column trees) |
@@ -166,9 +189,9 @@ load (tested).
 Environment: GTX 1660 Ti (6 GB), PyTorch 2.14 + CUDA 13.0, Python 3.11 (`machine_learning`
 pyenv), installed with `pip install --no-build-isolation`.
 
-* **Test suite:** 105 tests pass, both against the in-place build and against the installed
-  package: 50 pre-existing, plus 55 new in `test_regressions.py`, `test_nan_features.py`,
-  `test_custom_objective.py` and `test_dataset_objective.py`. Not run: `tests/test_invariant.py`
+* **Test suite:** 108 tests pass, both against the in-place build and against the installed
+  package: 50 pre-existing, plus 58 new in `test_regressions.py`, `test_nan_features.py`,
+  `test_custom_objective.py` and `test_early_stopping.py`. Not run: `tests/test_invariant.py`
   (downloads data) and the `numerai_test.py` / `full_numerai_test.py` scripts.
 * **Determinism:** 8 repeated multiclass fits with the same `random_state` give identical trees;
   repeated `predict` calls are bit-identical.
@@ -190,9 +213,9 @@ pyenv), installed with `pip install --no-build-isolation`.
 * Training requires CUDA (the kernels have no CPU path), despite `device="cpu"` being mentioned
   upstream.
 * For classifiers, monotonic constraints apply to each class's logit, not to the probabilities.
-* Correlation-type `DatasetLossObjective`s need the warm-up (or a warm start from another
-  objective); with a small MSE weight λ, the prediction scale grows slowly. They are not expected
-  to beat MSE on targets that are already standardized the way the metric is computed (see
-  `docs/CUSTOM_OBJECTIVES.md` §3); they peak earlier, so use early stopping.
+* Custom losses must be per sample (a row's loss depends only on that row). Dataset-level losses
+  such as a Pearson correlation over all rows are not supported: they were tried and did not
+  train better than MSE on suitably standardized targets, at the cost of a much more complex
+  interface.
 * `torch.nanquantile` limits a single feature column to ~16M rows for quantile binning. This is a
   pre-existing limitation; pre-binned integer input avoids it.

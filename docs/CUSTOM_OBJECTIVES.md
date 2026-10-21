@@ -1,71 +1,124 @@
 # Custom objectives (loss functions)
 
-WarpGBM trains every model, built-in or custom, through one engine that only needs
-**gradients and hessians of the loss with respect to the raw model score**, computed on the GPU.
-The engine takes care of sample weights, missing targets, eras (directional era splitting),
-monotonic constraints, NaN features, warm starts, evaluation and early stopping. So a custom
-objective is usually just the math of the loss.
+WarpGBM trains every model, built-in or custom, through one engine that needs the
+**gradient and hessian of the loss with respect to the raw model score**, computed on the GPU.
+For a custom objective you usually write only the loss as a torch expression. PyTorch autograd
+supplies the gradient and the hessian, and the engine handles sample weights, missing targets,
+multiple outputs, eras (directional era splitting), monotonic constraints, NaN features, warm
+starts, evaluation and early stopping.
 
 ```python
-from warpgbm import WarpGBM, Objective, GradHessObjective, AutogradObjective, DatasetLossObjective, losses
+from warpgbm import WarpGBM, Objective, CustomObjective
 ```
-
-There are four ways to define a loss:
 
 | You have… | Use | Derivatives |
 |---|---|---|
-| a per-sample loss with known grad / hess | subclass `Objective` or `GradHessObjective(fn)` | you write them |
-| a per-sample loss as a torch expression | `AutogradObjective(loss_fn)` | autograd (diagonal hessian via a 2nd pass) |
-| a **dataset-level** loss (correlation, per-era statistics, …), possibly plus per-sample terms | `DatasetLossObjective(loss_fn)` | autograd gradient + curvature estimate |
-| just a function `(y, pred, ctx) -> (grad, hess)` | pass it directly: `WarpGBM(objective=fn)` | you write them |
+| a loss function `loss(y, pred)` | `WarpGBM(objective=loss)` | autograd |
+| a loss function plus options (init score, link, hessian mode, one tree per output, …) | `CustomObjective(loss_fn, ...)` | autograd |
+| known gradients / hessians | `CustomObjective(loss_fn, grad_hess_fn=...)`, or subclass `Objective` and override `grad_hess` | yours |
+| a reusable, picklable loss with parameters | subclass `Objective` and implement `loss` | autograd |
 
 ---
 
 ## 1. Conventions
 
-* **Shapes.** Raw scores `pred` are always `[N, K]` (K = number of outputs, 1 for ordinary
-  regression). Targets `y` are `[N, T]` float32. For regression-like objectives T = K. For the
-  built-in classifier T = 1 (encoded labels) and K = number of classes.
-* **Missing targets.** `NaN`/`inf` targets are treated as missing. Before your code sees `y`,
-  missing entries are **filled with 0**, so the math stays finite. Their gradients and hessians are
-  then zeroed with `torch.where` (NaN-safe). `ctx.mask` tells you which entries are observed.
-* **Sign convention.** Same as XGBoost/LightGBM: `grad = dL/dscore`, `hess = d²L/dscore²`.
-  Leaves are Newton steps `-Σgrad / (Σhess + L2_reg)` (summed over the rows in the leaf), clamped
-  to the monotonic bounds if constraints are active.
+* **Per-sample losses.** The loss of a row may depend only on that row's targets and scores. It
+  is returned **per entry** (`[N, K]`) or **per row** (`[N]`, for losses that couple the outputs
+  of a row, e.g. a cross-entropy). The engine never sees a dataset-level reduction; returning a
+  scalar raises an error.
+* **Shapes.** Raw scores `pred` are `[N, K]` (K = number of outputs, 1 for ordinary regression).
+  Targets `y` are `[N, T]` float32. For regression-like objectives T = K. For the built-in
+  classifier T = 1 (encoded labels) and K = number of classes.
+* **Missing targets.** `NaN`/`inf` targets are missing. Before your code sees `y`, missing
+  entries are **filled with 0** so the math stays finite; their gradients and hessians are zeroed
+  afterwards (with `torch.where`, so NaN-safe). Multi-output targets can have a different missing
+  pattern per output.
+* **Weights.** `sample_weight` is `[N]` or `[N, K]` and normalized to mean 1. You do **not** use
+  it in your loss. The engine multiplies the gradient and hessian entry-wise by the weight, which
+  is the same as training on `Σ_ik w_ik · loss_ik`.
+* **Sign convention.** As in XGBoost/LightGBM: `grad = dL/dscore`, `hess = d²L/dscore²`. Leaves
+  are Newton steps `-Σgrad / (Σhess + L2_reg)` over the rows in the leaf, clamped to the monotonic
+  bounds if constraints are active.
 * **Device.** Everything is a CUDA tensor; stay in torch to keep it on the GPU.
 
-### The context object
-
-Every call receives an `ObjectiveContext`:
-
-| field | shape | meaning |
-|---|---|---|
-| `ctx.weight` | `[N, K]` | normalized sample weight (mean 1), **already 0 where the target is missing** |
-| `ctx.mask` | `[N, K]` bool | observed score entries |
-| `ctx.target_mask` | `[N, T]` bool | observed target entries |
-| `ctx.era_index` | `[N]` int32 | era of each row, 0..E-1 (all 0 without `era_id`) |
-| `ctx.num_outputs` | int | K |
-| `ctx.iteration` | int | current boosting round (0 in `init_score` and evaluation) |
-| `ctx.row_weight` | `[N]` | mean of `ctx.weight` over outputs (used for `min_child_weight`) |
-
-### What the engine does with your output
-
-For per-sample objectives (`apply_weights = True`, the default):
+What the engine does each round:
 
 ```
-grad, hess = objective.grad_hess(y, pred, ctx)   # unweighted, [N, K] or broadcastable
-grad, hess = grad * ctx.weight, hess * ctx.weight
-grad, hess = where(ctx.mask, grad, 0), where(ctx.mask, hess, 0)
+grad, hess = objective.grad_hess(y, pred)      # default: autograd of objective.loss
+grad, hess = grad * weight, hess * weight      # weight: [N, K], 0 for missing targets
+grad, hess = where(mask, grad, 0), where(mask, hess, 0)
 ```
 
-It then checks that everything is finite and raises `FloatingPointError` otherwise. Objectives
-with `apply_weights = False` must apply the weights themselves (masked entries are still zeroed).
+It then checks that everything is finite and raises `FloatingPointError` otherwise.
 
 ---
 
-## 2. Per-sample losses
+## 2. Loss functions with autograd
 
-### Subclassing `Objective`
+### A plain function
+
+```python
+import torch
+from warpgbm import WarpGBM
+
+def log_cosh(y, pred):                        # [N, K] -> per-entry loss [N, K]
+    r = pred - y
+    return r + torch.nn.functional.softplus(-2 * r) - 0.693147
+
+model = WarpGBM(objective=log_cosh, n_estimators=200)
+model.fit(X, Y, sample_weight=W, era_id=eras)  # Y: (n,) or (n, K), may contain NaN; W: (n,) or (n, K)
+```
+
+### `CustomObjective`
+
+```python
+from warpgbm import CustomObjective
+
+q = 0.9
+pinball = CustomObjective(
+    loss_fn=lambda y, p: torch.maximum(q * (y - p), (q - 1) * (y - p)),
+    hessian="ones",                                       # zero curvature -> first-order boosting
+    init_fn=lambda y, weight: torch.quantile(y[:, 0], q).reshape(1),
+)
+
+poisson = CustomObjective(
+    loss_fn=lambda y, s: torch.exp(s) - y * s,            # log link
+    init_fn=lambda y, weight: torch.log(y.mean(dim=0)),
+    transform_fn=torch.exp,                               # predict() returns the rate, predict_raw() the log-rate
+    name="poisson",
+)
+```
+
+| argument | default | meaning |
+|---|---|---|
+| `loss_fn(y, pred)` | — | per-sample loss, `[N, K]` or `[N]` |
+| `grad_hess_fn(y, pred)` | `None` | explicit `(grad, hess)`, each `[N, K]` or broadcastable; replaces autograd |
+| `hessian` | `"autograd"` | `"autograd"`: exact diagonal hessian. `"ones"`: constant 1 (first-order boosting) |
+| `min_hessian` | `0.0` | autograd hessians are clamped to at least this value |
+| `init_fn(y, weight)` | one weighted Newton step from score 0 | constant start score, shape `[K]`; `weight` is `[N, K]` (0 for missing targets) |
+| `transform_fn(raw)` | identity | maps raw scores to predictions |
+| `output_strategy` | `"vector"` | `"vector"`: one tree per round with K-dimensional leaves (shared splits, gain summed over outputs). `"per_output"`: K trees per round, one per output |
+| `name` | `"custom"` | shown in log messages |
+
+At least one of `loss_fn` / `grad_hess_fn` is required. `loss_fn` is also used for the training
+log and as the default eval metric.
+
+### How the derivatives are computed
+
+The gradient is `autograd.grad(loss.sum(), pred)`. Rows are independent, so one more backward
+pass per output column gives the **exact diagonal hessian** `d²loss / dpred_k²` for every row,
+also for losses that couple the outputs of a row: a per-row softmax cross-entropy gives exactly
+`p(1 - p)`. The cost is 1 + K backward passes per round (2 for a single output).
+
+Losses with zero or near-zero curvature (L1, pinball, log-cosh at large residuals) give Newton
+leaves that are unbounded. Use `hessian="ones"`, or `min_hessian=...` together with `L2_reg`.
+
+---
+
+## 3. Subclassing `Objective`
+
+A subclass is the reusable, picklable form of a custom loss. Implement `loss` and gradients come
+from autograd; override `grad_hess` as well if you have cheaper or more stable closed forms.
 
 ```python
 import torch
@@ -77,262 +130,116 @@ class PseudoHuber(Objective):
     def __init__(self, delta=1.0):
         self.delta = delta
 
-    def grad_hess(self, y, pred, ctx):
+    def loss(self, y, pred):
+        return self.delta**2 * (torch.sqrt(1 + ((pred - y) / self.delta) ** 2) - 1)
+
+    # optional: explicit derivatives instead of autograd
+    def grad_hess(self, y, pred):
         r = pred - y
         scale = 1.0 + (r / self.delta) ** 2
         return r / torch.sqrt(scale), 1.0 / (scale * torch.sqrt(scale))
 
-    def loss(self, y, pred, ctx):            # optional: training log + default eval metric
-        return self.delta**2 * (torch.sqrt(1 + ((pred - y) / self.delta) ** 2) - 1)
-
-    def init_score(self, y, ctx):            # optional: constant start score, shape [K]
+    # optional: constant start score, shape [K]
+    def init_score(self, y, weight):
         return y.median(dim=0).values
 
 model = WarpGBM(objective=PseudoHuber(1.0), L2_reg=1.0, n_estimators=200)
-model.fit(X, y, sample_weight=w, era_id=eras)
 ```
-
-Hooks you can override:
 
 | method / attribute | default |
 |---|---|
-| `grad_hess(y, pred, ctx)` | **required** |
-| `loss(y, pred, ctx)` | none; return `[N, K]` (element-wise), `[N]` (per row) or a scalar |
-| `init_score(y, ctx)` → `[K]` | one weighted Newton step from score 0 |
-| `transform(raw)` | identity (e.g. return `torch.exp(raw)` for a log link) |
+| `loss(y, pred)` | none; `[N, K]` or `[N]`. Needed for autograd and for the `"loss"` metric |
+| `grad_hess(y, pred)` | autograd of `loss` |
+| `init_score(y, weight)` → `[K]` | one weighted Newton step from score 0 |
+| `transform(raw)` | identity |
+| `output_strategy` | `"vector"` |
+| `hessian`, `min_hessian` | `"autograd"`, `0.0` (autograd path) |
 | `prepare_targets(y_np)` → `[N, T]` | float32, 1-D → one column |
 | `num_outputs(y)` | `T` |
-| `output_strategy` | `"vector"`: one tree per round with K-dimensional leaves (shared splits, gain summed over outputs). `"per_output"`: K trees per round, one per score column |
-| `apply_weights` | `True` |
-| `default_metric` | `"loss"` (falls back to `"mse"` if `loss` is not implemented) |
+| `default_metric` | `"loss"` (falls back to `"mse"` without `loss`) |
 
-Custom objectives are pickled together with the model by `save_model`, so define the class at
-module level so that it can be imported again by `load_model`.
-
-### Plain functions: `GradHessObjective`
-
-```python
-# Poisson regression with a log link
-poisson = GradHessObjective(
-    lambda y, s, ctx: (torch.exp(s) - y, torch.exp(s)),
-    init_fn=lambda y, ctx: torch.log(y.mean(dim=0)),
-    transform_fn=torch.exp,          # predict() returns the rate, predict_raw() the log-rate
-    name="poisson",
-)
-```
-
-### Autograd: `AutogradObjective`
-
-```python
-log_cosh = AutogradObjective(lambda y, p: p - y + torch.nn.functional.softplus(-2 * (p - y)) - 0.693147)
-
-q = 0.9
-pinball = AutogradObjective(
-    lambda y, p: torch.maximum(q * (y - p), (q - 1) * (y - p)),
-    hessian="ones",                                   # zero curvature -> first-order boosting
-    init_fn=lambda y, ctx: torch.quantile(y[:, 0], q).reshape(1),
-)
-```
-
-`loss_fn(y, pred)` must be **element-wise** (`[N, K]` or `[N]`). The diagonal hessian comes from
-a second autograd pass over `sum(grad)`. This is exact for losses that are separable per entry;
-for losses that couple the outputs of a row it gives the row sums of the hessian. Use
-`hessian="ones"` for losses with zero or near-zero curvature (L1, pinball, log-cosh at large
-residuals), and/or `min_hessian=...` together with `L2_reg` to keep Newton leaves bounded.
+`save_model` pickles the objective with the model. Define custom classes and loss functions at
+module level (no lambdas) if you want to `load_model` them in another process.
 
 ---
 
-## 3. Dataset-level losses: `DatasetLossObjective`
-
-Use this for losses that are **not a sum over rows**, such as Pearson correlation over the whole
-dataset, per-era correlations, or a mix like `-corr + λ·MSE`.
-
-```python
-def loss_fn(y, pred, ctx) -> scalar tensor
-```
-
-Write the loss as a weighted **average** over the observed entries. The helpers in
-`warpgbm.losses` do this and accept `weight`, `mask` and an optional `group` (e.g. eras).
-
-### Example: multi-output Pearson correlation over the full dataset
-
-```python
-from warpgbm import WarpGBM, DatasetLossObjective, losses
-
-def pearson_mse(y, pred, ctx):
-    # y, pred: [N, K]; ctx.mask hides NaN targets per output; ctx.weight may be 2-D
-    corr = losses.pearson_corr(pred, y, weight=ctx.weight, mask=ctx.mask)      # [K], full dataset
-    mse = losses.weighted_mse(pred, y, weight=ctx.weight, mask=ctx.mask)       # keeps the scale fixed
-    return -corr.mean() + 0.1 * mse
-
-model = WarpGBM(objective=DatasetLossObjective(pearson_mse), n_estimators=300, max_depth=4, num_bins=32)
-model.fit(
-    X, Y,                         # Y: (n_samples, K), may contain NaN
-    sample_weight=W,              # (n_samples,) or (n_samples, K)
-    era_id=eras,                  # optional: directional era splitting during tree growth
-)
-P = model.predict(X_test)         # (n_samples, K)
-```
-
-* **Full dataset vs per era.** `pearson_corr(..., group=None)` correlates over all rows, one value
-  per output. With `group=ctx.era_index` it averages per-era correlations, weighted by era weight
-  (`group_weighting="equal"` gives every era the same weight, like Numerai's mean per-era corr).
-  `ctx.era_index` comes from `fit(..., era_id=...)`; without `era_id` it is all zeros and a
-  per-era loss silently becomes the pooled one.
-* **Eras for the loss vs eras for the trees.** Passing `era_id` also turns on directional era
-  splitting (DES) in the split finder, which is applied to whatever gradients your loss produces.
-  Pass `WarpGBM(era_splitting=False)` to give the eras to the loss only (pooled split finding).
-* **Multi-output.** `pearson_corr` handles each output column separately with its own mask and
-  weights, so outputs with different scales, offsets and missing patterns are fine. With the
-  default `output_strategy="vector"` all outputs share one tree per round (vector leaves). Pass
-  `output_strategy="per_output"` for one tree per output.
-
-### How the gradients are scaled
-
-The gradient of the averaged loss is multiplied by the total effective weight
-`ctx.weight.sum()`. This brings it to the per-sample scale of the engine, so `L2_reg`,
-`min_sum_hessian` and `learning_rate` keep their usual meaning. For example,
-`0.5 * losses.weighted_mse` gives exactly the gradients of the built-in squared error. Weights
-are not applied a second time (`apply_weights = False`).
-
-### Hessian options
-
-| `hessian=` | meaning | when |
-|---|---|---|
-| `"auto"` (default) | `h = c_k · ctx.weight`, where the curvature `c_k` of output k is measured along the gradient direction with one finite-difference Hessian-vector product per round. Needs first derivatives only. Exact for an MSE term | correlations and other scale-invariant losses, whose curvature grows like 1/std(pred)² |
-| `"ones"` | `h = ctx.weight` | first-order boosting; the learning rate alone sets the step size |
-| `"exact"` | autograd row-sum trick | separable parts are exact; shift-invariant parts (correlations) contribute 0 |
-| callable `fn(y, pred, ctx)` | your own diagonal hessian of the averaged loss | |
-
-In our experiments (multi-output Pearson + MSE, with NaN targets, 2-D weights, with and without
-eras), `"auto"` matched the out-of-sample correlation of a plain MSE model. `"ones"` and
-`"exact"` were noticeably worse at the same learning rate. `"auto"` uses the absolute value of the
-measured curvature, so a negative curvature (e.g. while a correlation is still negative) gives a
-descent step instead of flipping its sign.
-
-### Warm-up: why correlation losses don't start from a constant prediction
-
-A correlation is undefined for constant predictions, and its gradient grows like 1/std(pred).
-Boosting starts from a constant score, so `DatasetLossObjective` uses squared-error gradients for
-the first `warmup_rounds` rounds (default **10**, read from `ctx.iteration`) before switching to
-your loss. Without the warm-up, the first trees take huge steps and the predictions blow up
-(std ~1e6 in our tests). Set `warmup_rounds=0` for losses that are fine at constant predictions.
-The warm-up requires T == K. As an alternative, you can warm up explicitly and switch objectives
-(see §5).
-
-`warmup_target` chooses what the warm-up regresses on:
-
-| `warmup_target=` | warm-up regresses on | use for |
-|---|---|---|
-| `"raw"` (default) | the targets | losses with an MSE term on the raw targets |
-| `"standardized"` | the weighted, standardized targets per output (plus the current mean prediction) | pooled correlation losses, targets with very different scales |
-| `"era_standardized"` | the targets standardized within each era | per-era correlation losses |
-
-For pure correlation losses the standardized warm-ups were clearly better than `"raw"`: a raw
-warm-up spends its rounds on era offsets and on the largest-scale output, which a correlation
-does not reward. `losses.standardize(x, weight, mask, group)` is available for your own losses.
-
-The default `init_fn` is the weighted mean of the targets per output.
-
-### λ and the prediction scale
-
-Correlation is scale-invariant. The MSE term pins the scale: at the optimum the scale is the
-least-squares scale for any λ > 0. During training, a small λ lets the correlation curvature
-dominate, so the scale grows slowly. If you care about calibrated magnitudes, use a larger λ or
-more trees.
-
-### Correlation losses: math, assumptions and what to expect
-
-Notation: weights normalized to mean 1, `σ_p` the weighted std of the prediction, `z^y`, `z^p` the
-weighted standardized target and prediction, `ρ` their correlation (all per output, and per era
-for a per-era loss).
-
-* **Gradient.** For `L = -ρ`, after the rescaling above, `g_i = -(w_i / σ_p) (z^y_i - ρ z^p_i)`.
-  It sums to zero and is orthogonal to `p`: the trees never learn a shift or a rescaling of the
-  current prediction, only new directions. For a per-era loss this holds within every era, so
-  era-level offsets and scales have no effect on training.
-* **Curvature.** The Hessian is zero along the shift and scale directions and is `ρ / σ_p² · w`
-  on the directions orthogonal to them, which is what `hessian="auto"` measures. The Newton step
-  `Σ(-g) / Σh` along a tree's direction matches the exact line search for the correlation, so
-  `learning_rate` keeps its usual meaning. Because `g ∝ 1/σ_p` and `h ∝ 1/σ_p²`, each output's
-  split gain `G²/H` does not depend on that output's scale, so with multiple outputs every target
-  gets an equal say in the shared trees. Under multi-output MSE the largest-scale target dominates.
-* **Assumptions.** Predictions must not be constant (hence the warm-up). The diagonal hessian
-  `c_k · w` is an approximation: it is exact for directions orthogonal to `1` and `p`, and trees
-  are not restricted to those directions.
-* **Relation to MSE.** Maximizing the pooled correlation is equivalent to minimizing MSE after an
-  affine recalibration of the predictions. So **a correlation loss is not expected to beat MSE on
-  suitably standardized targets** (standardized per output, and per era for a per-era metric).
-  Its advantage is that it does that standardization implicitly and exactly, for the current
-  predictions, including NaN targets and 2-D weights. MSE on standardized targets also keeps
-  re-fitting the shrunken part of the current prediction, which acts as a mild regularizer.
-  The correlation gradient projects that direction out, so correlation losses tend to peak
-  earlier and need early stopping on a validation set.
-
-Results of an untuned study (synthetic data, 240 eras, train/validation/test split by era,
-checkpoint chosen on validation, 2 seeds, 400 trees, depth 4, learning rate 0.05; metric: per-era
-corr where eras matter, otherwise pooled; mean corr over outputs):
-
-| scenario | MSE | MSE, standardized targets | −corr (standardized warm-up) | −corr + 0.5·MSE(centred pred, standardized y) |
-|---|---|---|---|---|
-| single output, homoscedastic | 0.331 | 0.331 | 0.322 | 0.328 |
-| single output, large era offsets | 0.117 | 0.321 | 0.320 | 0.320 |
-| 3 outputs, scales 10 / 1 / 0.1 | 0.286 | 0.298 | 0.289 | 0.292 |
-| 3 outputs, era offsets + different scales | 0.163 | 0.293 | 0.288 | 0.290 |
-
-In short, the correlation loss beats MSE by a wide margin whenever offsets or scales differ
-between eras or outputs, and it ties (within ~0.01) with MSE on targets standardized the same
-way. DES works with correlation gradients like with any other gradients. On data without
-era-unstable features it costs a little in-sample fit, as it does for MSE.
-
-### Cost
-
-A dataset objective with `"auto"` evaluates `loss_fn` and its gradient twice per round, which is
-cheap for correlation-type losses (a few reductions on the GPU).
-
----
-
-## 4. Evaluation metrics
+## 4. Evaluation metrics and early stopping
 
 `fit(..., eval_metric=...)` accepts:
 
 * built-in strings: `"mse"`, `"corr"`, `"rmsle"` (single output), `"logloss"`, `"accuracy"`
-  (classification), and `"loss"` (the objective's own `loss`; works for scalar dataset losses);
+  (classification), and `"loss"` (weighted mean of the objective's `loss`). `"accuracy"` and
+  `"corr"` are maximized, the others minimized; all are reported as natural values;
 * `None` (default): the objective's `default_metric`. That is `"mse"` for regression,
   `"logloss"` for classification, and `"loss"` for custom objectives that implement `loss`;
-* a **callable**, `metric(y_true, pred, weight, mask) -> float`, where **lower is better** (early
-  stopping minimizes it). `pred` is the transformed prediction (what `predict` returns). Inputs
-  are 1-D for single-output regression and 2-D otherwise. If the callable takes an `era`
-  argument, it also receives the eval-set era index. Pass the eval eras with
-  `fit(..., era_id_eval=...)`:
+* a **callable** `metric(y_true, pred, weight, mask) -> float`, which is **minimized**. `pred` is
+  the transformed prediction (what `predict` returns); all inputs are GPU tensors, 1-D for
+  single-output regression and 2-D otherwise;
+* `Metric(fn, higher_is_better=True, name="...")` to **maximize** a callable (and name it in the
+  log).
 
 ```python
-def one_minus_per_era_corr(y_true, pred, weight, mask, era):
-    return 1.0 - float(losses.pearson_corr(pred, y_true, weight=weight, mask=mask, group=era).mean())
+from warpgbm import Metric
 
-model.fit(X, Y, era_id=eras, X_eval=Xv, y_eval=Yv, era_id_eval=eras_v,
-          eval_every_n_trees=10, early_stopping_rounds=5, eval_metric=one_minus_per_era_corr)
+def mae(y_true, pred, weight, mask):
+    w = weight * mask
+    return float((torch.abs(y_true - pred) * w).sum() / w.sum())
+
+model.fit(X, Y, X_eval=Xv, y_eval=Yv, eval_every_n_trees=10, early_stopping_rounds=5, eval_metric=mae)
 ```
+
+### Auxiliary per-row data
+
+Metrics that need per-row data besides the targets (raw targets, scales, groups, …) get it through
+`fit(..., eval_aux=A_eval, train_aux=A_train)`: numpy arrays of shape `[n]` or `[n, A]`, passed to
+the callable as `aux=` (a float32 GPU tensor of the same shape). The callable must have an `aux`
+parameter (or `**kwargs`). If `aux` has no default and `train_aux` is not given, the metric is
+not computed on the training set.
+
+```python
+# trained on y / sigma; early-stop on Pearson(pred * sigma, raw y clipped at +-10 sigma)
+def comp_corr(y_true, pred, weight, mask, aux):
+    y_raw, sigma = aux[:, 0], aux[:, 1]
+    a, b = pred * sigma, torch.clamp(y_raw, -10 * sigma, 10 * sigma)
+    a, b = a - a.mean(), b - b.mean()
+    return float((a * b).sum() / torch.sqrt((a * a).sum() * (b * b).sum()))
+
+model.fit(X, y / sigma, X_eval=Xv, y_eval=yv / sigma_v, eval_aux=np.column_stack([yv, sigma_v]),
+          eval_metric=Metric(comp_corr, higher_is_better=True), eval_every_n_trees=10,
+          early_stopping_rounds=20)
+```
+
+### Best iteration and rollback
+
+* The metric is evaluated every `eval_every_n_trees` rounds and at the last round. The results are
+  in `evals_result_ = {"train": [...], "eval": [...]}` (the eval metric on both sets) with the
+  round counts in `eval_iterations_`; `eval_loss` is an alias of `evals_result_["eval"]`, and
+  `training_loss` keeps the objective loss per round.
+* `best_iteration_` (number of rounds, 1-based) and `best_score_` record the best evaluation
+  (strictly better wins, so ties keep the earlier round; NaN never wins).
+* With `early_stopping_rounds=r`, training stops after `r` evaluations in a row without
+  improvement, and the **default model is the best one**: `predict`, `predict_raw`,
+  `predict_proba`, `get_feature_importance`, `get_per_era_feature_importance` and
+  `train_predictions_` use the first `best_iteration_` rounds. Without `early_stopping_rounds` the
+  eval set only monitors and all trees are used.
+* All trained trees are kept: `predict(X, num_trees=n)` (and the other methods) select any prefix
+  of rounds, and `truncate(num_trees=None)` drops the rounds after `best_iteration_`.
+* `get_feature_importance(num_trees=n)` is exact for any `n` (each split stores its gain). Per-era
+  importances are stored for `best_iteration_` and for all rounds only.
+* `train_predictions_`: in-sample raw scores of the default model, `[n_samples, n_outputs]`
+  (equal to `predict_raw(X_train)` up to float rounding). Not saved by `save_model`.
 
 ---
 
-## 5. Warm starts, objective switching, persistence
+## 5. Warm starts and persistence
 
-* `warm_start=True` continues from the existing trees (training scores are rebuilt from the
-  forest; the bin edges of the first fit are reused).
-* You may **switch the objective** between warm-start fits, as long as the score layout is
-  compatible (same `output_strategy`, same classifier/regressor type, same K). For example,
-  pre-train with MSE and fine-tune with a custom loss:
-
-  ```python
-  model = WarpGBM(objective="multi_regression", n_estimators=50, warm_start=True)
-  model.fit(X, Y, era_id=eras)
-  model.objective = DatasetLossObjective(pearson_mse, warmup_rounds=0)
-  model.n_estimators = 300
-  model.fit(X, Y, era_id=eras)
-  ```
-* `save_model` pickles the objective instance. Define custom classes and loss functions at module
-  level (no lambdas) if you want to `load_model` them in another process.
+* `warm_start=True` continues from the existing trees, always **after all trained rounds** (the
+  bin edges of the first fit are reused). To continue from the best round of an early-stopped
+  fit, call `model.truncate()` first. A continuation tracks its best round over its own
+  evaluations; without an eval set the model uses all trees.
+* The objective cannot change between warm-start fits (this raises a `ValueError`).
+* `save_model` pickles the objective instance (see §3) and keeps `best_iteration_`,
+  `best_score_` and the eval history, so a loaded model predicts with the same default model.
 
 ---
 
@@ -340,10 +247,10 @@ model.fit(X, Y, era_id=eras, X_eval=Xv, y_eval=Yv, era_id_eval=eras_v,
 
 | feature | behaviour with custom objectives |
 |---|---|
-| sample weights | `[N]` or `[N, T]`, normalized to mean 1; `ctx.weight` is 0 for missing targets |
+| sample weights | `[N]` or `[N, K]`, normalized to mean 1, applied to grad/hess by the engine; 0 for missing targets |
 | `min_child_weight` | minimum **sum of row weights** in a child (≈ row count when unweighted); independent of the hessian scale |
 | `min_sum_hessian` | per output: an output whose child hessian sum is below this does not contribute to the split gain |
-| eras / DES | per-era histograms of your gradients; the gain is averaged over eras and split directions must agree across eras. `era_splitting=False` keeps the eras in `ctx.era_index` but splits on pooled histograms |
+| eras / DES | per-era histograms of the gradients; the gain is averaged over eras and split directions must agree across eras |
 | monotonic constraints | value bounds are propagated to the children and leaves are clamped, for every output (vector leaves) or per class tree |
 | NaN features | own bin with a learned default direction, independent of the objective |
 | determinism | histograms are accumulated in fixed point and predictions sum the trees in a fixed order, so with `random_state` set, results are bit-reproducible run to run |

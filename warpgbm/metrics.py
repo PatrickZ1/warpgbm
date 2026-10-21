@@ -125,3 +125,30 @@ def weighted_corr_loss_torch(y_true, y_pred, sample_weight=None, eps=1e-12):
 
     corr = cov / torch.sqrt(torch.clamp(var_true * var_pred, min=eps))
     return 1.0 - corr
+
+
+class Metric:
+    """
+    A callable evaluation metric with an optimization direction, for ``fit(eval_metric=...)``.
+
+    Args:
+        fn: fn(y_true, pred, weight, mask[, aux]) -> float, on GPU tensors.
+        higher_is_better: False (default) to minimize the metric, True to maximize it
+                          (e.g. a correlation or accuracy).
+        name: shown in the training log; defaults to ``fn.__name__``.
+
+    A plain callable passed as ``eval_metric`` is minimized.
+    """
+
+    def __init__(self, fn, higher_is_better=False, name=None):
+        if not callable(fn):
+            raise TypeError("Metric fn must be callable.")
+        self.fn = fn
+        self.higher_is_better = bool(higher_is_better)
+        self.name = name or getattr(fn, "__name__", "metric")
+
+    def __call__(self, *args, **kwargs):
+        return self.fn(*args, **kwargs)
+
+    def __repr__(self):
+        return f"Metric(name={self.name!r}, higher_is_better={self.higher_is_better})"
