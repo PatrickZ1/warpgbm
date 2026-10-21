@@ -84,10 +84,15 @@ replaces the three previous copies (`_fit_regression`, `_fit_multi_regression`,
   gradient + diagonal hessian), or a plain callable `(y, pred, ctx) -> (grad, hess)`;
 * dataset-level losses: `DatasetLossObjective(loss_fn)`, e.g. multi-output Pearson correlation
   over the full dataset plus an MSE term, with NaN targets, 2-D weights and era splitting. It
-  provides gradient rescaling, an `"auto"` curvature estimate and a squared-error warm-up
-  (`warmup_rounds`, default 10), because correlations are undefined at constant predictions;
+  provides gradient rescaling, an `"auto"` curvature estimate (absolute value, so negative
+  curvature still gives a descent step) and a squared-error warm-up (`warmup_rounds`, default 10;
+  `warmup_target="raw" | "standardized" | "era_standardized"`), because correlations are
+  undefined at constant predictions. The correlation math, its assumptions and a comparison with
+  MSE are in `docs/CUSTOM_OBJECTIVES.md` §3;
 * `warpgbm/losses.py`: GPU helpers `pearson_corr` (weighted, masked, per output, optionally per
-  group/era) and `weighted_mse`;
+  group/era, groups weighted by weight or equally), `standardize` and `weighted_mse`;
+* `WarpGBM(era_splitting=False)`: the objective still receives the eras (`ctx.era_index`, e.g.
+  for a per-era correlation loss), but splits are found on pooled histograms without DES;
 * `output_strategy="vector"` (one tree per round with K-dimensional leaves) or `"per_output"`
   (K trees per round);
 * objective switching on warm start (e.g. MSE pre-training, then a custom loss);
@@ -129,6 +134,9 @@ load (tested).
 
 ### 3.4 Other
 
+* The prediction kernel sums the trees of a sample in a fixed order (one thread per sample)
+  instead of using float `atomicAdd` across trees. Repeated `predict` calls are now
+  bit-identical; before, they differed by a few ULPs.
 * `min_sum_hessian` hyperparameter (default 1e-3). `min_child_weight` now also accepts floats
   (≥ 0).
 * Training-time evaluation adds only the newest round to cached eval scores instead of
@@ -147,6 +155,7 @@ load (tested).
 | `num_outputs` | `None` for classifiers | K (number of classes) for every model |
 | warm start | recomputed bin edges | reuses the first fit's bin edges |
 | tree nodes | `"feature"` was a 0-d CUDA tensor | Python int, plus a `"nan_left"` flag |
+| `predict` | float atomics over trees (last-bit noise between calls) | deterministic summation order |
 | CUDA API (`node_kernel`) | — | changed signatures: histogram (K channels, count, fixed-point scales), split (`[E,F,B,K]`, count, `min_sum_hessian`, 2·B candidates), binner (`nan_bin`), predict (`nan_bin`, 7-column trees) |
 | single-output regression without NaNs/weights | — | same predictions as before up to float rounding (max abs diff 6e-5 at prediction scale 540) |
 
@@ -157,11 +166,12 @@ load (tested).
 Environment: GTX 1660 Ti (6 GB), PyTorch 2.14 + CUDA 13.0, Python 3.11 (`machine_learning`
 pyenv), installed with `pip install --no-build-isolation`.
 
-* **Test suite:** 98 tests pass, both against the in-place build and against the installed
-  package: 50 pre-existing, plus 48 new in `test_regressions.py`, `test_nan_features.py`,
+* **Test suite:** 105 tests pass, both against the in-place build and against the installed
+  package: 50 pre-existing, plus 55 new in `test_regressions.py`, `test_nan_features.py`,
   `test_custom_objective.py` and `test_dataset_objective.py`. Not run: `tests/test_invariant.py`
   (downloads data) and the `numerai_test.py` / `full_numerai_test.py` scripts.
-* **Determinism:** 8 repeated multiclass fits with the same `random_state` give identical trees.
+* **Determinism:** 8 repeated multiclass fits with the same `random_state` give identical trees;
+  repeated `predict` calls are bit-identical.
 * **Refactor sanity:** single-output regression (plain, with eras, with `colsample_bytree`)
   matches the previous version's predictions to float rounding.
 * **Benchmark** (300k × 50, 100 trees, depth 6, 64 bins; multiclass 50 rounds, depth 5, 32 bins):
@@ -181,6 +191,8 @@ pyenv), installed with `pip install --no-build-isolation`.
   upstream.
 * For classifiers, monotonic constraints apply to each class's logit, not to the probabilities.
 * Correlation-type `DatasetLossObjective`s need the warm-up (or a warm start from another
-  objective); with a small MSE weight λ, the prediction scale grows slowly.
+  objective); with a small MSE weight λ, the prediction scale grows slowly. They are not expected
+  to beat MSE on targets that are already standardized the way the metric is computed (see
+  `docs/CUSTOM_OBJECTIVES.md` §3); they peak earlier, so use early stopping.
 * `torch.nanquantile` limits a single feature column to ~16M rows for quantile binning. This is a
   pre-existing limitation; pre-binned integer input avoids it.

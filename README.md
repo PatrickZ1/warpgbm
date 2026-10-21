@@ -441,6 +441,7 @@ WarpGBM(
     random_state=None,             # Random seed for reproducibility
     warm_start=False,              # If True, continue training from existing trees
     monotonic_constraints=None,    # Optional: vector or dict {feature_idx: -1|0|1}
+    era_splitting=True,            # Use era_id for directional era splitting (False: eras only reach the objective)
     threads_per_block=64,          # CUDA block size (tune for your GPU)
     rows_per_thread=4,             # Rows processed per thread
     device='cuda'                  # 'cuda' or 'cpu' (GPU strongly recommended)
@@ -572,7 +573,8 @@ Built on the shoulders of PyTorch, scikit-learn, LightGBM, XGBoost, and the CUDA
 - 🧩 Custom objective API (`Objective`, `GradHessObjective`, `AutogradObjective`, `DatasetLossObjective`) and `warpgbm.losses`
 - 🕳️ NaN feature bin with learned default direction
 - 🎯 Multi-output regression, sample weights, monotonic constraints (with bound propagation)
-- 🔁 Deterministic fixed-point histograms; global-memory fallback for many eras
+- 🔁 Deterministic fixed-point histograms and prediction; global-memory fallback for many eras
+- 📈 Correlation losses: standardized warm-up targets, `era_splitting=False` for per-era losses without DES
 - 🐛 Fixes: multi-output split gain, `min_child_weight` with classification, class priors at prediction, weighted base score
 - 📚 [docs/FORK_CHANGES.md](docs/FORK_CHANGES.md), [docs/CUSTOM_OBJECTIVES.md](docs/CUSTOM_OBJECTIVES.md)
 

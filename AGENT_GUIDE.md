@@ -121,7 +121,7 @@ warpgbm/
 │   ├── GradHessObjective, AutogradObjective, DatasetLossObjective   # custom losses
 │   └── compute_grad_hess()  # applies weights + NaN-target masks, finiteness check
 │
-├── losses.py                # GPU helpers for dataset-level losses (pearson_corr, weighted_mse)
+├── losses.py                # GPU helpers for dataset-level losses (pearson_corr, standardize, weighted_mse)
 ├── metrics.py               # Evaluation metrics (weighted MSE / corr / RMSLE / logloss / accuracy)
 │
 └── cuda/

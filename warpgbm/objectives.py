@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from warpgbm import losses
 from warpgbm.metrics import softmax
 
 VECTOR = "vector"
@@ -433,7 +434,7 @@ class DatasetLossObjective(Objective):
                             rate alone then sets the step size.
                  "exact" -> autograd row-sum trick (exact for separable parts such as an MSE
                             term; zero for shift-invariant parts such as correlations; requires
-                            twice-differentiable losses, i.e. not soft_rank).
+                            twice-differentiable losses).
                  callable fn(y, pred, ctx) -> [N, K] hessian on the averaged loss scale.
         min_hessian: hessians are clamped to at least this value (after rescaling).
         init_fn: fn(y, ctx) -> [K] initial score. Default: weighted mean of the targets
@@ -443,13 +444,20 @@ class DatasetLossObjective(Objective):
                  such as correlations are undefined for constant predictions (their gradient
                  grows like 1 / std(pred)), so they need non-degenerate predictions to start
                  from. Requires targets with one column per score (T == K); set to 0 to disable.
+        warmup_target: what the warm-up rounds regress on:
+                 "raw"              -> (default) the targets themselves (plain MSE).
+                 "standardized"     -> the weighted, standardized targets (per column), added to
+                                       the current mean prediction. Matches scale-invariant
+                                       losses better when the targets have very different scales.
+                 "era_standardized" -> as "standardized" but within each era (``ctx.era_index``);
+                                       the natural choice for per-era correlation losses.
         transform_fn, output_strategy, name: see :class:`GradHessObjective`.
 
     Scaling: gradients (and "exact"/callable hessians) of the averaged loss are multiplied by
     the total effective weight ``ctx.weight.sum()``. ``0.5 * losses.weighted_mse`` written this
     way thus gets exactly the gradients of the per-sample built-in, and ``L2_reg``,
-    ``min_sum_hessian`` and ``learning_rate`` keep their usual meaning. Weights are *not* applied again by the engine
-    (``apply_weights = False``); masked entries are still zeroed.
+    ``min_sum_hessian`` and ``learning_rate`` keep their usual meaning. Weights are *not* applied
+    again by the engine (``apply_weights = False``); masked entries are still zeroed.
     """
 
     apply_weights = False
@@ -465,7 +473,10 @@ class DatasetLossObjective(Objective):
         name: str = "dataset_loss",
         curvature_floor: float = 1e-6,
         warmup_rounds: int = 10,
+        warmup_target: str = "raw",
     ):
+        if warmup_target not in ("raw", "standardized", "era_standardized"):
+            raise ValueError("warmup_target must be 'raw', 'standardized' or 'era_standardized'.")
         if not callable(hessian) and hessian not in ("auto", "ones", "exact"):
             raise ValueError("hessian must be 'auto', 'ones', 'exact' or a callable.")
         if output_strategy not in _STRATEGIES:
@@ -479,6 +490,7 @@ class DatasetLossObjective(Objective):
         self.name = name
         self.curvature_floor = float(curvature_floor)
         self.warmup_rounds = int(warmup_rounds)
+        self.warmup_target = warmup_target
 
     def _loss_grad(self, y, pred, ctx, create_graph=False):
         with torch.enable_grad():
@@ -504,17 +516,29 @@ class DatasetLossObjective(Objective):
         hv = (g2.detach() - g.detach()) / delta
         numer = (v * hv).sum(dim=0) * scale
         denom = (ctx.weight * v * v).sum(dim=0).clamp(min=1e-30)
-        return torch.clamp(numer / denom, min=self.curvature_floor)
+        # Negative curvature (e.g. a correlation that is currently negative) would flip the
+        # Newton step; |c| keeps it a descent step of a sensible size.
+        return torch.clamp(torch.abs(numer / denom), min=self.curvature_floor)
+
+    def _warmup_grad_hess(self, y, pred, ctx):
+        if y.shape[1] != pred.shape[1]:
+            raise ValueError(
+                "warmup_rounds > 0 needs one target column per score column; "
+                "pass warmup_rounds=0 or an init_fn with non-degenerate predictions."
+            )
+        target = y
+        if self.warmup_target != "raw":
+            group = ctx.era_index if self.warmup_target == "era_standardized" else None
+            z = losses.standardize(y, weight=ctx.weight, mask=ctx.mask, group=group)
+            w = ctx.weight * ctx.mask.to(pred.dtype)
+            mean_p = (w * pred).sum(dim=0) / w.sum(dim=0).clamp(min=1e-12)
+            target = mean_p + z
+        # squared-error warm-up (weights are applied here since apply_weights=False)
+        return (pred - target) * ctx.weight, ctx.weight
 
     def grad_hess(self, y, pred, ctx):
         if ctx.iteration < self.warmup_rounds:
-            if y.shape[1] != pred.shape[1]:
-                raise ValueError(
-                    "warmup_rounds > 0 needs one target column per score column; "
-                    "pass warmup_rounds=0 or an init_fn with non-degenerate predictions."
-                )
-            # squared-error warm-up (weights are applied here since apply_weights=False)
-            return (pred - y) * ctx.weight, ctx.weight
+            return self._warmup_grad_hess(y, pred, ctx)
 
         # The loss is an average: rescale to the per-sample ("sum") scale of the engine
         scale = ctx.weight.sum()

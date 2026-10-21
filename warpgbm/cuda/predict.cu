@@ -6,6 +6,7 @@
 //   0: feature, 1: split_bin, 2: left_id, 3: right_id, 4: is_leaf, 5: leaf_value, 6: nan_left
 #define NODE_WIDTH 7
 
+// One thread per sample; trees are summed in order so predictions are bit-reproducible.
 __global__ void predict_forest_kernel(
     const int8_t *__restrict__ bin_indices, // [N x F]
     const float *__restrict__ tree_tensor,  // [T x max_nodes x NODE_WIDTH]
@@ -15,40 +16,36 @@ __global__ void predict_forest_kernel(
     float *__restrict__ out // [N]
 )
 {
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t total_jobs = N * T;
-    if (idx >= total_jobs)
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= N)
         return;
 
-    int64_t i = idx % N; // sample index
-    int64_t t = idx / N; // tree index
-
-    const float *tree = tree_tensor + t * max_nodes * NODE_WIDTH;
-
-    int node_id = 0;
-    while (true)
+    // prevent overflow
+    const int8_t *row = bin_indices + i * F;
+    float acc = 0.0f;
+    for (int64_t t = 0; t < T; ++t)
     {
-        const float *node = tree + node_id * NODE_WIDTH;
-        float is_leaf = node[4];
-        if (is_leaf > 0.5f)
+        const float *tree = tree_tensor + t * max_nodes * NODE_WIDTH;
+        int node_id = 0;
+        while (true)
         {
-            atomicAdd(&out[i], learning_rate * node[5]);
-            return;
+            const float *node = tree + node_id * NODE_WIDTH;
+            if (node[4] > 0.5f) // is_leaf
+            {
+                acc += learning_rate * node[5];
+                break;
+            }
+
+            int feat = static_cast<int>(node[0]);
+            int split_bin = static_cast<int>(node[1]);
+            bool nan_left = node[6] > 0.5f;
+            int bin = row[feat];
+
+            bool go_left = (bin == nan_bin) ? nan_left : (bin <= split_bin);
+            node_id = go_left ? static_cast<int>(node[2]) : static_cast<int>(node[3]);
         }
-
-        int feat = static_cast<int>(node[0]);
-        int split_bin = static_cast<int>(node[1]);
-        int left_id = static_cast<int>(node[2]);
-        int right_id = static_cast<int>(node[3]);
-        bool nan_left = node[6] > 0.5f;
-
-        // prevent overflow
-        int64_t bin_idx = i * F + feat;
-        int bin = bin_indices[bin_idx];
-
-        bool go_left = (bin == nan_bin) ? nan_left : (bin <= split_bin);
-        node_id = go_left ? left_id : right_id;
     }
+    out[i] += acc;
 }
 
 
@@ -68,12 +65,11 @@ void predict_with_forest(
     int64_t T = tree_tensor.size(0);
     int64_t max_nodes = tree_tensor.size(1);
 
-    int64_t total_jobs = N * T;
-    if (total_jobs == 0)
+    if (N == 0 || T == 0)
         return;
 
     int threads_per_block = 256;
-    int64_t blocks = (total_jobs + threads_per_block - 1) / threads_per_block;
+    int64_t blocks = (N + threads_per_block - 1) / threads_per_block;
 
     predict_forest_kernel<<<blocks, threads_per_block>>>(
         bin_indices.data_ptr<int8_t>(),

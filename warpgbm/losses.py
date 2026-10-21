@@ -59,6 +59,32 @@ def weighted_mse(pred: Tensor, target: Tensor, weight=None, mask=None) -> Tensor
     return (w * err2).sum() / w.sum().clamp(min=1e-12)
 
 
+def standardize(
+    x: Tensor,
+    weight: Optional[Tensor] = None,
+    mask: Optional[Tensor] = None,
+    group: Optional[Tensor] = None,
+    eps: float = 1e-12,
+) -> Tensor:
+    """
+    Weighted standardization (zero mean, unit variance) per column, within each group if
+    ``group`` is given. Masked entries are returned as 0. Differentiable.
+    """
+    x2, w, m = _prepare(x, weight, mask)
+    g, num_groups = _group_index(group, x2.shape[0], x2.device)
+    zero = torch.zeros((), device=x2.device, dtype=x2.dtype)
+    x2 = torch.where(m, x2, zero)
+
+    def gsum(v):
+        return torch.zeros(num_groups, x2.shape[1], device=v.device, dtype=v.dtype).index_add(0, g, v)
+
+    w_safe = gsum(w).clamp(min=1e-12)
+    centered = x2 - (gsum(w * x2) / w_safe)[g]
+    std = torch.sqrt(gsum(w * centered * centered) / w_safe + eps)
+    out = torch.where(m, centered / std[g], zero)
+    return out[:, 0] if x.ndim == 1 else out
+
+
 # ─── Correlation ─────────────────────────────────────────────────────────────
 
 
@@ -69,14 +95,18 @@ def pearson_corr(
     mask: Optional[Tensor] = None,
     group: Optional[Tensor] = None,
     eps: float = 1e-12,
+    group_weighting: str = "weight",
 ) -> Tensor:
     """
     Weighted Pearson correlation between ``a`` and ``b``, differentiable in both.
 
-    Returns a tensor of shape [K] (scalar for 1-D inputs): the weighted mean over groups of the
-    per-group correlation (groups weighted by their total weight). Groups whose variance is zero
-    contribute a correlation of 0.
+    Returns a tensor of shape [K] (scalar for 1-D inputs): the mean over groups of the per-group
+    correlation. ``group_weighting="weight"`` weights groups by their total weight,
+    ``"equal"`` gives every non-empty group the same weight (Numerai-style mean per-era corr).
+    Groups whose variance is zero contribute a correlation of 0.
     """
+    if group_weighting not in ("weight", "equal"):
+        raise ValueError("group_weighting must be 'weight' or 'equal'.")
     a2, w, m = _prepare(a, weight, mask)
     b2 = _as_2d(b).to(a2.dtype).expand_as(a2)
     zero = torch.zeros((), device=a2.device, dtype=a2.dtype)
@@ -100,6 +130,7 @@ def pearson_corr(
     var_b = gsum(w * cb * cb) / w_safe
     corr = cov / torch.sqrt(var_a * var_b + eps)
 
-    group_weight = w_g / w_g.sum(dim=0, keepdim=True).clamp(min=1e-12)
+    gw = w_g if group_weighting == "weight" else (w_g > 0).to(w_g.dtype)
+    group_weight = gw / gw.sum(dim=0, keepdim=True).clamp(min=1e-12)
     out = (group_weight * corr).sum(dim=0)
     return out[0] if a.ndim == 1 else out

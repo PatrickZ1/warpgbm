@@ -273,3 +273,14 @@ def test_models_saved_in_the_legacy_format_still_load(objective, tmp_path):
         proba = loaded.predict_proba(X)
         assert proba.shape == (1000, 3) and np.allclose(proba.sum(axis=1), 1.0, atol=1e-5)
         assert (loaded.predict(X) == y).mean() > 0.8
+
+
+def test_predictions_are_bit_reproducible():
+    # the predict kernel sums trees in a fixed order (it used float atomics across trees)
+    rng = np.random.default_rng(3)
+    X = rng.normal(size=(5000, 8)).astype(np.float32)
+    y = (X[:, 0] + np.sin(X[:, 1]) + rng.normal(size=5000)).astype(np.float32)
+    model = WarpGBM(n_estimators=200, max_depth=5, random_state=0).fit(X, y)
+    first = model.predict(X)
+    for _ in range(3):
+        np.testing.assert_array_equal(model.predict(X.copy()), first)

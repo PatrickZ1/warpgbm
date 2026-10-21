@@ -256,3 +256,114 @@ def test_dataset_objective_rejects_non_scalar_loss():
     bad = DatasetLossObjective(lambda y, p, ctx: (p - y) ** 2, warmup_rounds=0)
     with pytest.raises(ValueError, match="scalar"):
         WarpGBM(objective=bad, n_estimators=2).fit(X, np.nan_to_num(Y))
+
+
+# ─── standardization, group weighting, era handling, warm-up targets, curvature ──
+
+
+def test_standardize_matches_numpy_masked_weighted_and_grouped():
+    rng = np.random.default_rng(11)
+    n, k = 3000, 2
+    x = 3.0 + 2.0 * rng.normal(size=(n, k))
+    w = rng.uniform(0.2, 3.0, size=(n, k))
+    mask = rng.random((n, k)) > 0.2
+    group = rng.integers(0, 4, size=n)
+    t = lambda a: torch.tensor(a, device=DEV)
+    z = losses.standardize(t(x), weight=t(w), mask=t(mask), group=t(group)).cpu().numpy()
+    for j in range(k):
+        assert (z[~mask[:, j], j] == 0).all()
+        for g in range(4):
+            m = mask[:, j] & (group == g)
+            mu = np.average(x[m, j], weights=w[m, j])
+            sd = np.sqrt(np.average((x[m, j] - mu) ** 2, weights=w[m, j]))
+            np.testing.assert_allclose(z[m, j], (x[m, j] - mu) / sd, rtol=1e-8, atol=1e-8)
+    # 1-D in -> 1-D out
+    assert losses.standardize(t(x[:, 0])).shape == (n,)
+
+
+def test_pearson_corr_equal_group_weighting():
+    rng = np.random.default_rng(12)
+    sizes = [50, 500, 2000]
+    group = np.repeat(np.arange(3), sizes)
+    a = rng.normal(size=group.size)
+    b = a * np.array([0.1, 0.5, 2.0])[group] + rng.normal(size=group.size)
+    t = lambda x: torch.tensor(x, device=DEV)
+    equal = losses.pearson_corr(t(a), t(b), group=t(group), group_weighting="equal").item()
+    ref = np.mean([np.corrcoef(a[group == g], b[group == g])[0, 1] for g in range(3)])
+    assert abs(equal - ref) < 1e-10
+    with pytest.raises(ValueError, match="group_weighting"):
+        losses.pearson_corr(t(a), t(b), group_weighting="size")
+
+
+class EraRecorder(DatasetLossObjective):
+    def __init__(self):
+        super().__init__(half_mse, warmup_rounds=0)
+        self.num_eras_seen = None
+
+    def grad_hess(self, y, pred, ctx):
+        self.num_eras_seen = int(ctx.era_index.max().item()) + 1
+        return super().grad_hess(y, pred, ctx)
+
+
+def test_era_splitting_false_keeps_eras_for_the_loss_only():
+    X, Y, W, era = _multi_output_data(13, n_eras=8, per_era=200, nan_frac=0.0)
+    y = Y[:, 0]
+    rec = EraRecorder()
+    model = WarpGBM(objective=rec, era_splitting=False, **COMMON).fit(X, y, era_id=era)
+    assert rec.num_eras_seen == 8       # the loss sees the eras ...
+    assert model.num_eras == 1          # ... the split finder does not
+    no_eras = WarpGBM(objective="regression", **COMMON).fit(X, y)
+    pooled = WarpGBM(objective="regression", era_splitting=False, **COMMON).fit(X, y, era_id=era)
+    np.testing.assert_array_equal(pooled.predict(X), no_eras.predict(X))
+    with pytest.raises(TypeError, match="era_splitting"):
+        WarpGBM(era_splitting="yes")
+
+
+@pytest.mark.parametrize("target", ["standardized", "era_standardized"])
+def test_standardized_warmup_targets(target):
+    # During warm-up the objective regresses on (per-era) standardized targets on top of the
+    # mean prediction, i.e. it behaves like MSE trained on the standardized targets.
+    X, Y, W, era = _multi_output_data(14, n_eras=6, per_era=300, nan_frac=0.0)
+    Y[:, 2] *= 100.0
+    params = dict(n_estimators=3, max_depth=3, random_state=0, L2_reg=0.0)
+    obj = DatasetLossObjective(pearson_mse, warmup_rounds=3, warmup_target=target)
+    warm = WarpGBM(objective=obj, **params).fit(X, Y, era_id=era)
+
+    if target == "standardized":
+        Z = (Y - Y.mean(0)) / Y.std(0)
+    else:
+        Z = np.empty_like(Y)
+        for e in np.unique(era):
+            i = era == e
+            Z[i] = (Y[i] - Y[i].mean(0)) / Y[i].std(0)
+    ref = WarpGBM(objective="multi_regression", **params).fit(X, Z, era_id=era)
+    expected = ref.predict(X) - Z.mean(0) + Y.mean(0)
+    np.testing.assert_allclose(warm.predict(X), expected, rtol=1e-3, atol=1e-3)
+    with pytest.raises(ValueError, match="warmup_target"):
+        DatasetLossObjective(pearson_mse, warmup_target="ranks")
+
+
+def neg_corr(y, pred, ctx):
+    return -losses.pearson_corr(pred, y, weight=ctx.weight, mask=ctx.mask).mean()
+
+
+def test_auto_curvature_matches_theory_and_stays_positive_for_negative_correlation():
+    # For L = -corr the curvature along the gradient is rho / var(pred) (sum scale);
+    # with rho < 0 the auto hessian uses |c| so the Newton step remains a descent step.
+    X, Y, W, era = _multi_output_data(15, n_eras=4, per_era=500, nan_frac=0.0)
+    model = WarpGBM(objective=DatasetLossObjective(neg_corr, warmup_rounds=0), n_estimators=1)
+    model.objective_ = model._resolve_objective()
+    model.num_outputs = 3
+    era_t = torch.zeros(len(Y), device=DEV, dtype=torch.int32)
+    Y_gpu, ctx = model._build_context(model.objective_.prepare_targets(Y), None, era_t)
+    from warpgbm.objectives import compute_grad_hess
+
+    for sign in (1.0, -1.0):
+        pred = sign * Y_gpu + 2.0 * torch.randn_like(Y_gpu)
+        g, h = compute_grad_hess(model.objective_, Y_gpu, pred, ctx)
+        rho = losses.pearson_corr(pred, Y_gpu)
+        c = h[0] / ctx.weight[0]
+        torch.testing.assert_close(c, rho.abs() / pred.var(dim=0, unbiased=False), rtol=2e-2, atol=0)
+        # one Newton step along -g/h increases the correlation
+        stepped = pred - 0.5 * g / h
+        assert (losses.pearson_corr(stepped, Y_gpu) > rho).all()

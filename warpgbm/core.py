@@ -83,6 +83,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         warm_start=False,
         monotonic_constraints=None,
         min_sum_hessian=1e-3,
+        era_splitting=True,
     ):
         # Validate arguments
         self._validate_hyperparams(
@@ -99,6 +100,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             colsample_bytree=colsample_bytree,
             monotonic_constraints=monotonic_constraints,
             min_sum_hessian=min_sum_hessian,
+            era_splitting=era_splitting,
         )
 
         self.objective = objective
@@ -124,6 +126,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.min_child_weight = min_child_weight
         self.min_split_gain = min_split_gain
         self.min_sum_hessian = min_sum_hessian
+        self.era_splitting = era_splitting
         self.threads_per_block = threads_per_block
         self.rows_per_thread = rows_per_thread
         self.L2_reg = L2_reg
@@ -222,6 +225,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             raise ValueError(
                 f"Invalid colsample_bytree: {kwargs['colsample_bytree']}. Must be a float value > 0 and <= 1."
             )
+
+        if not isinstance(kwargs.get("era_splitting", True), bool):
+            raise TypeError("era_splitting must be a bool.")
 
         mc = kwargs.get("monotonic_constraints")
         if mc is not None and not isinstance(mc, (list, tuple, np.ndarray, dict)):
@@ -771,11 +777,18 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.preprocess_gpu_data(X, era_id, reuse_edges=continuing)
         )
         self.num_samples, self.num_features = X.shape
-        self.num_eras = len(self.unique_eras)
-        self.era_indices = self.era_indices.to(dtype=torch.int32)
+        # The objective always sees the eras (ctx.era_index, e.g. for per-era losses);
+        # directional era splitting in the trees can be switched off independently.
+        loss_era_index = self.era_indices.to(dtype=torch.int32)
+        if self.era_splitting:
+            self.num_eras = len(self.unique_eras)
+            self.era_indices = loss_era_index
+        else:
+            self.num_eras = 1
+            self.era_indices = torch.zeros_like(loss_era_index)
 
         self.Y_gpu, self.ctx = self._build_context(
-            y_prepared, sample_weight, self.era_indices
+            y_prepared, sample_weight, loss_era_index
         )
         self.row_weight_gpu = self.ctx.row_weight.contiguous()
         self._count_scale = self._fixed_point_scale(
@@ -1643,6 +1656,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             "min_child_weight": self.min_child_weight,
             "min_split_gain": self.min_split_gain,
             "min_sum_hessian": self.min_sum_hessian,
+            "era_splitting": self.era_splitting,
             "L2_reg": self.L2_reg,
             "colsample_bytree": self.colsample_bytree,
             "random_state": self.random_state,
@@ -1712,6 +1726,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.min_child_weight = state['min_child_weight']
         self.min_split_gain = state['min_split_gain']
         self.min_sum_hessian = state.get('min_sum_hessian', 1e-3)
+        self.era_splitting = state.get('era_splitting', True)
         self.L2_reg = state['L2_reg']
         self.colsample_bytree = state['colsample_bytree']
         self.random_state = state['random_state']

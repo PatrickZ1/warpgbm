@@ -175,9 +175,13 @@ P = model.predict(X_test)         # (n_samples, K)
 ```
 
 * **Full dataset vs per era.** `pearson_corr(..., group=None)` correlates over all rows, one value
-  per output. With `group=ctx.era_index` it averages per-era correlations (weighted by era
-  weight). Either can be combined with `era_id`. The era-splitting split criterion is applied
-  to whatever gradients your loss produces.
+  per output. With `group=ctx.era_index` it averages per-era correlations, weighted by era weight
+  (`group_weighting="equal"` gives every era the same weight, like Numerai's mean per-era corr).
+  `ctx.era_index` comes from `fit(..., era_id=...)`; without `era_id` it is all zeros and a
+  per-era loss silently becomes the pooled one.
+* **Eras for the loss vs eras for the trees.** Passing `era_id` also turns on directional era
+  splitting (DES) in the split finder, which is applied to whatever gradients your loss produces.
+  Pass `WarpGBM(era_splitting=False)` to give the eras to the loss only (pooled split finding).
 * **Multi-output.** `pearson_corr` handles each output column separately with its own mask and
   weights, so outputs with different scales, offsets and missing patterns are fine. With the
   default `output_strategy="vector"` all outputs share one tree per round (vector leaves). Pass
@@ -202,7 +206,9 @@ are not applied a second time (`apply_weights = False`).
 
 In our experiments (multi-output Pearson + MSE, with NaN targets, 2-D weights, with and without
 eras), `"auto"` matched the out-of-sample correlation of a plain MSE model. `"ones"` and
-`"exact"` were noticeably worse at the same learning rate.
+`"exact"` were noticeably worse at the same learning rate. `"auto"` uses the absolute value of the
+measured curvature, so a negative curvature (e.g. while a correlation is still negative) gives a
+descent step instead of flipping its sign.
 
 ### Warm-up: why correlation losses don't start from a constant prediction
 
@@ -214,6 +220,18 @@ your loss. Without the warm-up, the first trees take huge steps and the predicti
 The warm-up requires T == K. As an alternative, you can warm up explicitly and switch objectives
 (see §5).
 
+`warmup_target` chooses what the warm-up regresses on:
+
+| `warmup_target=` | warm-up regresses on | use for |
+|---|---|---|
+| `"raw"` (default) | the targets | losses with an MSE term on the raw targets |
+| `"standardized"` | the weighted, standardized targets per output (plus the current mean prediction) | pooled correlation losses, targets with very different scales |
+| `"era_standardized"` | the targets standardized within each era | per-era correlation losses |
+
+For pure correlation losses the standardized warm-ups were clearly better than `"raw"`: a raw
+warm-up spends its rounds on era offsets and on the largest-scale output, which a correlation
+does not reward. `losses.standardize(x, weight, mask, group)` is available for your own losses.
+
 The default `init_fn` is the weighted mean of the targets per output.
 
 ### λ and the prediction scale
@@ -222,6 +240,50 @@ Correlation is scale-invariant. The MSE term pins the scale: at the optimum the 
 least-squares scale for any λ > 0. During training, a small λ lets the correlation curvature
 dominate, so the scale grows slowly. If you care about calibrated magnitudes, use a larger λ or
 more trees.
+
+### Correlation losses: math, assumptions and what to expect
+
+Notation: weights normalized to mean 1, `σ_p` the weighted std of the prediction, `z^y`, `z^p` the
+weighted standardized target and prediction, `ρ` their correlation (all per output, and per era
+for a per-era loss).
+
+* **Gradient.** For `L = -ρ`, after the rescaling above, `g_i = -(w_i / σ_p) (z^y_i - ρ z^p_i)`.
+  It sums to zero and is orthogonal to `p`: the trees never learn a shift or a rescaling of the
+  current prediction, only new directions. For a per-era loss this holds within every era, so
+  era-level offsets and scales have no effect on training.
+* **Curvature.** The Hessian is zero along the shift and scale directions and is `ρ / σ_p² · w`
+  on the directions orthogonal to them, which is what `hessian="auto"` measures. The Newton step
+  `Σ(-g) / Σh` along a tree's direction matches the exact line search for the correlation, so
+  `learning_rate` keeps its usual meaning. Because `g ∝ 1/σ_p` and `h ∝ 1/σ_p²`, each output's
+  split gain `G²/H` does not depend on that output's scale, so with multiple outputs every target
+  gets an equal say in the shared trees. Under multi-output MSE the largest-scale target dominates.
+* **Assumptions.** Predictions must not be constant (hence the warm-up). The diagonal hessian
+  `c_k · w` is an approximation: it is exact for directions orthogonal to `1` and `p`, and trees
+  are not restricted to those directions.
+* **Relation to MSE.** Maximizing the pooled correlation is equivalent to minimizing MSE after an
+  affine recalibration of the predictions. So **a correlation loss is not expected to beat MSE on
+  suitably standardized targets** (standardized per output, and per era for a per-era metric).
+  Its advantage is that it does that standardization implicitly and exactly, for the current
+  predictions, including NaN targets and 2-D weights. MSE on standardized targets also keeps
+  re-fitting the shrunken part of the current prediction, which acts as a mild regularizer.
+  The correlation gradient projects that direction out, so correlation losses tend to peak
+  earlier and need early stopping on a validation set.
+
+Results of an untuned study (synthetic data, 240 eras, train/validation/test split by era,
+checkpoint chosen on validation, 2 seeds, 400 trees, depth 4, learning rate 0.05; metric: per-era
+corr where eras matter, otherwise pooled; mean corr over outputs):
+
+| scenario | MSE | MSE, standardized targets | −corr (standardized warm-up) | −corr + 0.5·MSE(centred pred, standardized y) |
+|---|---|---|---|---|
+| single output, homoscedastic | 0.331 | 0.331 | 0.322 | 0.328 |
+| single output, large era offsets | 0.117 | 0.321 | 0.320 | 0.320 |
+| 3 outputs, scales 10 / 1 / 0.1 | 0.286 | 0.298 | 0.289 | 0.292 |
+| 3 outputs, era offsets + different scales | 0.163 | 0.293 | 0.288 | 0.290 |
+
+In short, the correlation loss beats MSE by a wide margin whenever offsets or scales differ
+between eras or outputs, and it ties (within ~0.01) with MSE on targets standardized the same
+way. DES works with correlation gradients like with any other gradients. On data without
+era-unstable features it costs a little in-sample fit, as it does for MSE.
 
 ### Cost
 
@@ -281,7 +343,7 @@ model.fit(X, Y, era_id=eras, X_eval=Xv, y_eval=Yv, era_id_eval=eras_v,
 | sample weights | `[N]` or `[N, T]`, normalized to mean 1; `ctx.weight` is 0 for missing targets |
 | `min_child_weight` | minimum **sum of row weights** in a child (≈ row count when unweighted); independent of the hessian scale |
 | `min_sum_hessian` | per output: an output whose child hessian sum is below this does not contribute to the split gain |
-| eras / DES | per-era histograms of your gradients; the gain is averaged over eras and split directions must agree across eras |
+| eras / DES | per-era histograms of your gradients; the gain is averaged over eras and split directions must agree across eras. `era_splitting=False` keeps the eras in `ctx.era_index` but splits on pooled histograms |
 | monotonic constraints | value bounds are propagated to the children and leaves are clamped, for every output (vector leaves) or per class tree |
 | NaN features | own bin with a learned default direction, independent of the objective |
-| determinism | histograms are accumulated in fixed point, so with `random_state` set, results are reproducible run to run |
+| determinism | histograms are accumulated in fixed point and predictions sum the trees in a fixed order, so with `random_state` set, results are bit-reproducible run to run |
