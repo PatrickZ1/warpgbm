@@ -101,7 +101,7 @@ WarpGBM.fit()
 
 ```
 warpgbm/
-├── __init__.py              # Package exports (WarpGBM, Objective, CustomObjective)
+├── __init__.py              # Package exports (WarpGBM, Objective, CustomObjective, fit_bins, apply_bins)
 ├── core.py                  # Main WarpGBM class: ONE training engine for all objectives
 │   ├── fit()                # validation → targets/weights/masks → grow_forest()
 │   ├── grow_forest()        # boosting loop: objective.grad_hess → one vector tree or K per-output trees
@@ -121,10 +121,12 @@ warpgbm/
 │   └── compute_grad_hess()  # applies weights + NaN-target masks, finiteness check
 │
 ├── metrics.py               # Evaluation metrics (weighted MSE / corr / RMSLE / logloss / accuracy)
+├── binning.py               # fit_bins / apply_bins (public), pre-binned input validation
 │
 └── cuda/
     ├── node_kernel.cpp      # Python/CUDA bridge
-    ├── binner.cu            # Quantile binning (NaN -> dedicated bin)
+    ├── __init__.py          # _get_node_kernel(): lazy import of the compiled extension
+    ├── binner.cu            # Quantile binning of a whole matrix (NaN -> dedicated bin)
     ├── histogram_kernel.cu  # Deterministic fixed-point histograms [E,F,B,K] + count channel
     ├── best_split_kernel.cu # Per-candidate gains (2 NaN directions), summed over outputs, DES directions
     └── predict.cu           # Tree traversal (7-column flattened trees with NaN direction)
@@ -207,14 +209,22 @@ Trees are stored as nested Python dictionaries:
 
 WarpGBM quantizes continuous features into discrete bins for histogram-based training.
 
-**Automatic Binning** (default):
-- Computes quantile-based bin edges per feature (`torch.nanquantile`, NaNs excluded)
-- Uses CUDA kernel for fast assignment; NaN values go to the extra bin `num_bins` (`model.nan_bin`)
+**Automatic Binning** (raw features):
+- `warpgbm/binning.py` is the single implementation, used by `fit` / `predict` and exposed as
+  `warpgbm.fit_bins(X, num_bins, device)` and `warpgbm.apply_bins(X, edges, device)`
+- Edges: `torch.nanquantile` per feature (NaNs excluded, all-NaN columns → 0), computed for blocks of
+  features to bound the sort workspace
+- Assignment: one CUDA launch over the whole `[N, F]` matrix (`bin_matrix`), bin = number of edges ≤ x;
+  NaN → the internal bin `num_bins` (`model.nan_bin`), or -1 (`MISSING_BIN`) in `apply_bins`' output
 - Stored in `self.bin_edges`; reused on warm start
 
-**Pre-binned Data**:
-- If input is integer with `max(X) < num_bins`, skips binning
-- Huge speedup for pre-quantized data (e.g., Numerai)
+**Pre-binned Data** (`prebinned=True`, stored as `prebinned_`):
+- Integer input = bin indices `0 … num_bins-1`, `-1` = missing; mapped to the internal NaN bin on the GPU
+- Applies to `X`, `X_eval`, `predict*`; float input or values outside `[-1, num_bins-1]` raise
+  (`binning._prebinned_to_gpu`); `bin_edges` is `None`
+- `prebinned=None` (default) auto-detects at fit time (integers in `[0, num_bins-1]`); the decision is
+  stored in `prebinned_`, so prediction never guesses
+- The NaN bin index `num_bins` is a label, not an ordering: splits route it by `nan_left`
 
 ### 5. Histograms
 
@@ -322,6 +332,9 @@ change between warm-start fits (`_resolve_objective` raises).
   `evals_result_` / `eval_iterations_` and the best round (`best_iteration_`, `best_score_`,
   direction from `_HIGHER_IS_BETTER` or `Metric.higher_is_better`), and stops after
   `early_stopping_rounds` evaluations without improvement.
+- `training_loss` (objective loss on the training set) costs a full pass and a host sync, so with
+  `record_training_loss="eval"` (default) it is only computed at checkpoints (reusing the training
+  score when the eval metric is the same loss); `"all"` records every round, `"none"` nothing.
 - `_rollback` (set when `early_stopping_rounds` was given) makes `_default_num_trees()` return
   `best_iteration_`; every prediction / importance method resolves `num_trees=None` through it.
   The tree-tensor cache is keyed on the number of rounds.
@@ -333,7 +346,7 @@ change between warm-start fits (`_resolve_objective` raises).
 
 **save_model()**:
 - Pickles all model state (hyperparameters + trained state)
-- Includes: `forest`, `objective_` (the Objective instance — custom classes must be importable), `bin_edges` and `base_prediction` (on CPU), `num_outputs`, `label_encoder`, feature importances, `_trees_trained`, etc.
+- Includes: `forest`, `objective_` (the Objective instance — custom classes must be importable), `bin_edges` and `base_prediction` (on CPU), `prebinned_`, `num_outputs`, `label_encoder`, feature importances, `_trees_trained`, etc.
 - Uses standard Python pickle (simple, portable)
 
 **load_model()**:
@@ -741,7 +754,7 @@ ValueError: y contains previously unseen labels
 **4. Slow Training**
 
 **Check**:
-- Are you using pre-binned data but not getting speedup? (Check if it's actually integers < num_bins)
+- Are you using pre-binned data but not getting speedup? (Pass `prebinned=True`; check `model.prebinned_`)
 - Is `colsample_bytree` too small? (More sampling = more randomness = slower convergence)
 - Is `max_depth` too large? (Exponential growth in tree size)
 

@@ -180,6 +180,52 @@ load (tested).
 * **`verbose`** constructor parameter (default `True`) gates every `print` in `core.py`. It is
   not saved by `save_model`; the loading instance's value applies.
 
+### 3.7 Explicit pre-binned input, public binning, training-loss switch (v2.6.0)
+
+* **`prebinned=True`** (constructor, saved by `save_model`). Integer input holds bin indices
+  `0 … num_bins-1` and `-1` for a missing value. `-1` is mapped to the internal NaN bin `num_bins`
+  on the GPU (`masked_fill_`). The same contract and validation apply wherever data enters:
+  `X` and `X_eval` in `fit`, `predict`, `predict_raw`, `predict_proba`. Non-integer dtypes raise
+  `TypeError`. Values outside `[-1, num_bins-1]` raise `ValueError` naming the column; wider
+  dtypes are checked before narrowing to int8, so 300 does not wrap to 44. The mode is stored as
+  `prebinned_`, and `bin_edges` is `None` for such models.
+* **The mode is decided once, at fit.** `prebinned=None` (default) keeps the old auto-detection
+  (integers all in `[0, num_bins-1]`), but stores its decision in `prebinned_`. Integer input that
+  fails the check is quantile-binned with a `UserWarning` that points to `prebinned=True/False`.
+  `prebinned=False` always quantile-bins. Before, `predict` re-ran the heuristic on every call, and
+  that caused two bugs:
+  - a model fitted on floats treated small integer input as bin indices;
+  - pre-binned data containing the NaN bin (value `num_bins`) failed the check and was silently
+    quantile-binned again.
+  Negative integers also passed the old check (`max < num_bins`) and reached the histogram kernel
+  as negative bin indices.
+* **`warpgbm.fit_bins(X, num_bins, device)`** returns the `[F, num_bins-1]` edge tensor, and
+  **`warpgbm.apply_bins(X, edges, device)`** returns int8 bins with `-1` (`warpgbm.MISSING_BIN`)
+  for NaN: numpy in, numpy out; tensor in, tensor out. Both live in `warpgbm/binning.py`, which
+  `fit` / `predict` use too, so external binning cannot drift from the internal one. A model fitted
+  on `apply_bins(X, fit_bins(X, B))` with `prebinned=True` has the same forest, eval history and
+  predictions as one fitted on `X` (tested).
+* **Vectorised binning.** `nanquantile` runs on blocks of features (≤ 2^24 elements per block, to
+  bound the sort workspace) instead of one column at a time. The CUDA binner bins the whole
+  row-major `[N, F]` matrix in one launch (grid-stride, 64-bit indices) instead of one launch per
+  column on a transposed copy. Same rule (linear scan, first edge > x), so edges, bins, forests and
+  predictions are bit-identical to v2.5.0 (checked at 7/64/127 bins with NaNs, ties and an
+  all-NaN column). Applying edges is ~2× faster (200k × 100: 29 → 15 ms). Edge computation is
+  dominated by the sort and is unchanged.
+* **`record_training_loss`** (`"eval"` default, `"all"`, `"none"`). `training_loss` used to cost a
+  full training-set loss plus a `.item()` host sync after every tree. It is now computed only at
+  evaluation checkpoints, aligned with `eval_iterations_`, and reuses the training score when the
+  eval metric is that same loss. Training itself is unchanged (tested). Fits with an eval set were
+  ~5–10 % faster at 20k rows × 300 trees; the saving grows with N × K and with costly custom losses.
+* **Fix: NaNs with the sign bit set.** NaNs with the sign bit set, which numpy and polars produce
+  for 0/0, were sorted before all numbers by the CUDA sort inside `torch.nanquantile`, so they were
+  counted as values. The lower edges then became NaN → 0 and the edges were unsorted. `fit` mis-binned
+  the feature silently, and `apply_bins` rejected the edges. CPU `nanquantile` was not affected.
+  `_quantile_edges` now canonicalises NaNs per feature block before taking the quantiles. The binning
+  kernel uses `isnan()` and was always correct. Edges for data with ordinary NaNs are unchanged.
+* `_get_node_kernel` moved to `warpgbm/cuda/__init__.py` (`warpgbm.core._get_node_kernel` still
+  imports). `predict*` now checks the feature count of its input.
+
 ---
 
 ## 4. Behaviour changes to be aware of
@@ -197,9 +243,11 @@ load (tested).
 | `feature_importance_`, `per_era_feature_importance_` | all trained trees | the default model (best round after early stopping) |
 | tree nodes | `"feature"` was a 0-d CUDA tensor | Python int, plus a `"nan_left"` flag |
 | `predict` | float atomics over trees (last-bit noise between calls) | deterministic summation order |
-| CUDA API (`node_kernel`) | — | changed signatures: histogram (K channels, count, fixed-point scales), split (`[E,F,B,K]`, count, `min_sum_hessian`, 2·B candidates), binner (`nan_bin`), predict (`nan_bin`, 7-column trees) |
+| CUDA API (`node_kernel`) | — | changed signatures: histogram (K channels, count, fixed-point scales), split (`[E,F,B,K]`, count, `min_sum_hessian`, 2·B candidates), binner (`nan_bin`; v2.6.0: `custom_cuda_binner` per column → `bin_matrix` for a whole `[N, F]` matrix), predict (`nan_bin`, 7-column trees) |
 | global RNG state | `fit` seeded torch / numpy / CUDA global RNGs with `random_state` | untouched; code that relied on this side effect must seed itself. With `random_state=None` the column draws no longer depend on earlier global seeding |
 | single-output regression without NaNs/weights | — | same predictions as before up to float rounding (max abs diff 6e-5 at prediction scale 540) |
+| pre-binned detection (v2.6.0) | heuristic `integer and max < num_bins` at fit **and** at every predict | explicit `prebinned=True` (-1 = missing), or auto-detection once at fit (`[0, num_bins-1]`), stored as `prebinned_`. Float input to a pre-binned model raises; integer input to a raw-feature model is binned with its edges. Pre-binned models have `bin_edges=None`. Older pickles keep binning with their stored (identity) edges |
+| `training_loss` (v2.6.0) | one value per round | one value per eval checkpoint by default; `record_training_loss="all"` restores per-round values. Older pickles load with `"all"` |
 
 ---
 
@@ -212,6 +260,8 @@ pyenv), installed with `pip install --no-build-isolation`.
   package: 50 pre-existing, plus 58 new in `test_regressions.py`, `test_nan_features.py`,
   `test_custom_objective.py` and `test_early_stopping.py`. Not run: `tests/test_invariant.py`
   (downloads data) and the `numerai_test.py` / `full_numerai_test.py` scripts.
+  v2.6.0: 142 pass (26 new in `test_prebinned.py`) and 2 skip: the `cuda:1` tests in
+  `test_multi_gpu.py` need a second GPU.
 * **Determinism:** 8 repeated multiclass fits with the same `random_state` give identical trees;
   repeated `predict` calls are bit-identical.
 * **Refactor sanity:** single-output regression (plain, with eras, with `colsample_bytree`)
@@ -236,5 +286,5 @@ pyenv), installed with `pip install --no-build-isolation`.
   such as a Pearson correlation over all rows are not supported: they were tried and did not
   train better than MSE on suitably standardized targets, at the cost of a much more complex
   interface.
-* `torch.nanquantile` limits a single feature column to ~16M rows for quantile binning. This is a
-  pre-existing limitation; pre-binned integer input avoids it.
+* Older PyTorch versions limit `torch.nanquantile` to ~16M rows per feature column. PyTorch 2.14
+  has no such limit (tested with 33M rows). Pre-binned integer input avoids the quantiles anyway.

@@ -14,6 +14,7 @@ In this version, we have made the following changes:
 - Added support for multi-regression (vector targets, NaN = missing target)
 - **Custom loss functions on the GPU**: write the per-sample loss as a torch expression; gradients and hessians come from autograd (or supply them explicitly). Works with multi-output targets, sample weights, missing targets, eras, monotonic constraints and warm starts. See [docs/CUSTOM_OBJECTIVES.md](docs/CUSTOM_OBJECTIVES.md)
 - **Missing feature values**: NaN features get their own bin with a learned default direction
+- **Explicit pre-binned input** (`prebinned=True`, missing = -1) and WarpGBM's own binning as public functions (`warpgbm.fit_bins` / `warpgbm.apply_bins`)
 - **Early stopping with rollback**: the best evaluated round is recorded (`best_iteration_`, `best_score_`); predictions, feature importances and in-sample `train_predictions_` use the best model; higher-is-better metrics, custom metrics with per-row auxiliary data (`eval_aux` / `train_aux`)
 - Deterministic training (fixed-point histograms), a global-memory fallback for many eras, and several bug fixes (multi-output split gain, `min_child_weight` with classification, class priors at prediction, weighted base score)
 
@@ -409,12 +410,17 @@ model_loaded.fit(X, y)  # Resumes from 50 → 100 trees
 
 ### Pre-binned Data: Maximum Speed (Numerai Example)
 
+With `prebinned=True`, integer input holds bin indices `0 … num_bins-1` and `-1` for a missing value;
+WarpGBM uses them as they are in `fit` (`X` and `X_eval`), `predict`, `predict_raw` and `predict_proba`.
+Anything else raises: float input, or values outside `[-1, num_bins-1]`. The mode is stored on the model
+(`prebinned_`, kept by `save_model`), and such a model has no `bin_edges`.
+
 ```python
 import pandas as pd
 from numerapi import NumerAPI
 from warpgbm import WarpGBM
 
-# Download Numerai data (already quantized to integers)
+# Download Numerai data (already quantized to integers 0..4)
 napi = NumerAPI()
 napi.download_dataset('v5.0/train.parquet', 'train.parquet')
 train = pd.read_parquet('train.parquet')
@@ -423,12 +429,34 @@ features = [f for f in train.columns if 'feature' in f]
 X = train[features].astype('int8').values
 y = train['target'].values
 
-# WarpGBM detects pre-binned data and skips binning
-model = WarpGBM(max_depth=5, n_estimators=100, num_bins=20)
+model = WarpGBM(max_depth=5, n_estimators=100, num_bins=20, prebinned=True)
 model.fit(X, y)  # Blazing fast!
 ```
 
 **Result: 13× faster than LightGBM on Numerai data (49s vs 643s)**
+
+To bin raw features once and share the bins between several models (or fits and predictions), use
+WarpGBM's own binning. It computes exactly what `fit` does internally: `torch.nanquantile` edges, and
+bin = number of edges ≤ x.
+
+```python
+import warpgbm
+
+edges = warpgbm.fit_bins(X_train, num_bins=32, device="cuda")   # [n_features, 31] tensor on the GPU
+B_train = warpgbm.apply_bins(X_train, edges)                    # int8 numpy, -1 where X is NaN
+B_valid = warpgbm.apply_bins(X_valid, edges)
+
+model = WarpGBM(num_bins=32, prebinned=True)
+model.fit(B_train, y_train, X_eval=B_valid, y_eval=y_valid, eval_every_n_trees=10)
+preds = model.predict(warpgbm.apply_bins(X_test, edges))
+```
+
+A model fitted on `B_train` is identical to one fitted on `X_train` with the same `num_bins`.
+`apply_bins` returns a tensor on the device for a tensor input.
+
+Without `prebinned` (the default `None`), integer input whose values all lie in `[0, num_bins-1]` is
+detected as pre-binned at fit time (legacy behaviour); other integer input is quantile-binned with a
+warning. `prebinned=False` always quantile-bins.
 
 ---
 
@@ -491,6 +519,9 @@ WarpGBM(
     rows_per_thread=4,             # Rows processed per thread
     device='cuda',                 # 'cuda' (current device) or 'cuda:N'; training requires CUDA
     verbose=True,                  # False silences all training / save / load messages
+    prebinned=None,                # True: integer X are bin indices 0..num_bins-1, -1 = missing (no binning);
+                                   #   False: always quantile-bin; None: auto-detect at fit (legacy)
+    record_training_loss='eval',   # training_loss at eval checkpoints ('eval'), every round ('all') or 'none'
 )
 ```
 
@@ -578,7 +609,8 @@ model_loaded.load_model('checkpoint.pkl')  # Restores everything
 model.classes_                    # Unique class labels (classification only)
 model.num_classes                 # Number of classes (classification only)
 model.forest                      # Trained tree structures
-model.training_loss               # Training loss (objective loss) per round, if an eval set was given
+model.training_loss               # Training loss (objective loss), if an eval set was given: one value per
+                                  #   checkpoint (aligned with eval_iterations_) or per round (record_training_loss)
 model.evals_result_               # {"train": [...], "eval": [...]} eval metric per checkpoint (natural values)
 model.eval_iterations_            # Round count of every checkpoint
 model.eval_loss                   # Alias of evals_result_["eval"]
@@ -588,6 +620,8 @@ model.best_score_                 # Eval metric value at best_iteration_
 model.train_predictions_          # In-sample raw scores of the default model, (n_samples, n_outputs); not saved
 model.feature_importance_         # Feature importance of the default model (sum across eras)
 model.per_era_feature_importance_ # Per-era feature importance of the default model (when era_id used)
+model.prebinned_                  # Whether the model takes bin indices instead of raw features
+model.bin_edges                   # Bin edges [n_features, num_bins - 1] (None for pre-binned models)
 ```
 
 ---
@@ -651,7 +685,13 @@ Built on the shoulders of PyTorch, scikit-learn, LightGBM, XGBoost, and the CUDA
 
 ## 📝 Version History
 
-### v2.5.0 (Current)
+### v2.6.0 (Current)
+- 🧱 `prebinned=True`: explicit pre-binned input with `-1` for missing values, used as-is in `fit` / `X_eval` / `predict*`; float or out-of-range input raises; stored as `prebinned_`
+- 🔢 `warpgbm.fit_bins` / `warpgbm.apply_bins`: WarpGBM's binning as public GPU functions; the binning kernel now bins a whole matrix in one launch
+- ⏱️ `record_training_loss` (default `'eval'`): the training loss is computed at eval checkpoints only, saving a full training-set pass and a host sync per round
+- ⚠️ The predict-time pre-binned heuristic is gone: whether a model takes bins is decided once at fit
+
+### v2.5.0
 - 🖥️ `device="cuda:N"` works from any thread without switching the current device; kernels run on the current stream of the tensors' device
 - 🎲 Per-model random generator: concurrent fits are reproducible and `fit` no longer seeds the global torch / numpy RNGs
 - 🔇 `verbose=False` silences all messages

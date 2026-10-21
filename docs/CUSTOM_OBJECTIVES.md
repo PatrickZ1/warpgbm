@@ -214,7 +214,8 @@ model.fit(X, y / sigma, X_eval=Xv, y_eval=yv / sigma_v, eval_aux=np.column_stack
 * The metric is evaluated every `eval_every_n_trees` rounds and at the last round. The results are
   in `evals_result_ = {"train": [...], "eval": [...]}` (the eval metric on both sets) with the
   round counts in `eval_iterations_`; `eval_loss` is an alias of `evals_result_["eval"]`, and
-  `training_loss` keeps the objective loss per round.
+  `training_loss` keeps the objective loss on the training set at each checkpoint
+  (`record_training_loss="all"`: every round).
 * `best_iteration_` (number of rounds, 1-based) and `best_score_` record the best evaluation
   (strictly better wins, so ties keep the earlier round; NaN never wins).
 * With `early_stopping_rounds=r`, training stops after `r` evaluations in a row without

@@ -1,10 +1,10 @@
 import inspect
 import math
+import warnings
 from dataclasses import dataclass
 import torch
 import numpy as np
 import pickle
-import importlib
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.preprocessing import LabelEncoder
 from warpgbm.metrics import (
@@ -24,6 +24,16 @@ from warpgbm.objectives import (
     resolve_objective,
     weighted_loss,
 )
+from warpgbm.binning import (
+    MAX_NUM_BINS,
+    MIN_NUM_BINS,
+    _bin_matrix,
+    _check_device,
+    _prebinned_to_gpu,
+    _quantile_edges,
+    _to_float_gpu,
+)
+from warpgbm.cuda import _get_node_kernel
 import gc
 
 
@@ -41,9 +51,6 @@ class _TargetWeights:
         return self.weight.mean(dim=1)
 
 
-_NODE_KERNEL = None
-_NODE_KERNEL_IMPORT_ERROR = None
-
 # Width of a flattened tree node, see warpgbm/cuda/predict.cu
 _NODE_WIDTH = 7
 
@@ -51,39 +58,16 @@ _REGRESSION_METRICS = ["mse", "corr", "rmsle", "loss"]
 _MULTI_OUTPUT_METRICS = ["mse", "loss"]
 _CLASSIFICATION_METRICS = ["logloss", "accuracy", "loss"]
 _HIGHER_IS_BETTER = ("accuracy", "corr")
-
-
-def _get_node_kernel():
-    global _NODE_KERNEL
-    global _NODE_KERNEL_IMPORT_ERROR
-
-    if _NODE_KERNEL is not None:
-        return _NODE_KERNEL
-
-    if _NODE_KERNEL_IMPORT_ERROR is not None:
-        raise ImportError(
-            "WarpGBM CUDA extension 'warpgbm.cuda.node_kernel' is not available. "
-            "Build/install with CUDA-enabled PyTorch and CUDA toolkit, then run "
-            "`python setup.py build_ext --inplace`."
-        ) from _NODE_KERNEL_IMPORT_ERROR
-
-    try:
-        _NODE_KERNEL = importlib.import_module("warpgbm.cuda.node_kernel")
-    except ImportError as e:
-        _NODE_KERNEL_IMPORT_ERROR = e
-        raise ImportError(
-            "WarpGBM CUDA extension 'warpgbm.cuda.node_kernel' is not available. "
-            "Build/install with CUDA-enabled PyTorch and CUDA toolkit, then run "
-            "`python setup.py build_ext --inplace`."
-        ) from e
-
-    return _NODE_KERNEL
+_RECORD_TRAINING_LOSS = ("eval", "all", "none")
 
 
 class WarpGBM(BaseEstimator, RegressorMixin):
     # Defaults for instances pickled by versions without these attributes
     verbose = True
     _rng = None
+    prebinned = None
+    prebinned_ = False
+    record_training_loss = "all"
 
     def __init__(
         self,
@@ -104,6 +88,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         monotonic_constraints=None,
         min_sum_hessian=1e-3,
         verbose=True,
+        prebinned=None,
+        record_training_loss="eval",
     ):
         # Validate arguments
         self._validate_hyperparams(
@@ -121,6 +107,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             colsample_bytree=colsample_bytree,
             monotonic_constraints=monotonic_constraints,
             min_sum_hessian=min_sum_hessian,
+            prebinned=prebinned,
+            record_training_loss=record_training_loss,
         )
 
         self.objective = objective
@@ -155,6 +143,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.warm_start = warm_start
         self.monotonic_constraints = monotonic_constraints
         self.verbose = verbose
+        self.prebinned = prebinned
+        self.record_training_loss = record_training_loss
+        self.prebinned_ = False
         self._rng = None
         self.label_encoder = None
         self.feature_importance_ = None
@@ -176,15 +167,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
     def _validate_hyperparams(self, **kwargs):
         # All kernels are CUDA-only; there is no CPU code path
-        device = kwargs["device"]
-        try:
-            device_type = torch.device(device).type
-        except (RuntimeError, TypeError) as e:
-            raise ValueError(f"Invalid device {device!r}.") from e
-        if device_type != "cuda":
-            raise ValueError(
-                f"WarpGBM requires a CUDA device ('cuda' or 'cuda:N'), got {device!r}."
-            )
+        _check_device(kwargs["device"])
 
         # Validate objective
         objective = kwargs["objective"]
@@ -234,8 +217,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             ):  # Accept ints as valid floats
                 raise TypeError(f"{param} must be a float, got {type(kwargs[param])}.")
 
-        if not (2 <= kwargs["num_bins"] <= 127):
-            raise ValueError("num_bins must be between 2 and 127 inclusive.")
+        if not (MIN_NUM_BINS <= kwargs["num_bins"] <= MAX_NUM_BINS):
+            raise ValueError(
+                f"num_bins must be between {MIN_NUM_BINS} and {MAX_NUM_BINS} inclusive."
+            )
         if kwargs["max_depth"] < 1:
             raise ValueError("max_depth must be at least 1.")
         if not (0.0 < kwargs["learning_rate"] <= 1.0):
@@ -261,6 +246,14 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         if kwargs["colsample_bytree"] <= 0 or kwargs["colsample_bytree"] > 1:
             raise ValueError(
                 f"Invalid colsample_bytree: {kwargs['colsample_bytree']}. Must be a float value > 0 and <= 1."
+            )
+
+        if kwargs["prebinned"] not in (None, True, False):
+            raise TypeError(f"prebinned must be None, True or False, got {kwargs['prebinned']!r}.")
+        if kwargs["record_training_loss"] not in _RECORD_TRAINING_LOSS:
+            raise ValueError(
+                f"record_training_loss must be one of {_RECORD_TRAINING_LOSS}, "
+                f"got {kwargs['record_training_loss']!r}."
             )
 
         mc = kwargs.get("monotonic_constraints")
@@ -335,7 +328,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
     @property
     def nan_bin(self):
-        """Bin index reserved for missing (NaN) feature values."""
+        """
+        Internal bin index of missing (NaN) feature values. It is a label, not an ordering:
+        splits route it by their learned nan_left flag. Pre-binned input uses -1 instead.
+        """
         return self.num_bins
 
     def _resolve_objective(self):
@@ -843,6 +839,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._rollback = rollback
         self._per_era_importance_best = None
         self.train_predictions_ = None
+        self.prebinned_ = self._resolve_prebinned(X, continuing)
 
         if era_id is None:
             era_id = np.ones(X.shape[0], dtype="int32")
@@ -911,7 +908,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         # ─── Optional Eval Set ───
         if X_eval is not None and y_eval is not None:
-            self.bin_indices_eval = self.bin_inference_data(X_eval)
+            self.bin_indices_eval = self.bin_inference_data(X_eval, name="X_eval")
             self.Y_gpu_eval, self.tw_eval = self._build_targets(
                 y_eval_prepared, sample_weight_eval
             )
@@ -1005,6 +1002,34 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             return "logloss"
         return eval_metric
 
+    def _resolve_prebinned(self, X, continuing):
+        """Whether X holds bin indices; decided once per model and stored as prebinned_."""
+        if continuing:
+            if self.prebinned is not None and bool(self.prebinned) != self.prebinned_:
+                raise ValueError(
+                    f"prebinned={self.prebinned} does not match the fitted model "
+                    f"(prebinned_={self.prebinned_}) when warm_start=True."
+                )
+            return self.prebinned_
+        if self.prebinned is not None:
+            return bool(self.prebinned)
+
+        # Legacy auto-detection (prebinned=None): integers that all lie in [0, num_bins - 1]
+        if not np.issubdtype(X.dtype, np.integer) or X.size == 0:
+            return False
+        if X.min() >= 0 and X.max() < self.num_bins:
+            if self.verbose:
+                print("Detected pre-binned integer input — skipping quantile binning.")
+            return True
+        warnings.warn(
+            f"Integer X has values outside [0, {self.num_bins - 1}] and is quantile-binned as raw "
+            "features. Pass prebinned=True for bin indices (-1 = missing) or prebinned=False to "
+            "silence this warning.",
+            UserWarning,
+            stacklevel=3,
+        )
+        return False
+
     def preprocess_gpu_data(self, X_np, era_id_np, reuse_edges=False):
         with torch.no_grad():
             self.num_samples, self.num_features = X_np.shape
@@ -1014,58 +1039,20 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             )
             unique_eras, era_indices = torch.unique(era_id_gpu, return_inverse=True)
 
+            if self.prebinned_:
+                # Bin indices are used as given; there are no bin edges
+                bin_indices = _prebinned_to_gpu(X_np, self.num_bins, self.device)
+                return bin_indices, era_indices, None, unique_eras
+
             if reuse_edges and self.bin_edges is not None:
                 self.bin_edges = self.bin_edges.to(self.device)
                 bin_indices = self.bin_inference_data(X_np)
                 return bin_indices, era_indices, self.bin_edges, unique_eras
 
-            is_integer_type = np.issubdtype(X_np.dtype, np.integer)
-
-            if is_integer_type and np.all(X_np.max(axis=0) < self.num_bins):
-                if self.verbose:
-                    print("Detected pre-binned integer input — skipping quantile binning.")
-                bin_indices = torch.as_tensor(X_np, device=self.device).to(
-                    dtype=torch.int8
-                ).contiguous()
-
-                # Identity edges so that integer bins map onto themselves at predict-time
-                bin_edges = torch.arange(
-                    1, self.num_bins, dtype=torch.float32
-                ).repeat(self.num_features, 1)
-                bin_edges = bin_edges.to(self.device)
-                return bin_indices, era_indices, bin_edges, unique_eras
-
-            bin_edges = torch.empty(
-                (self.num_features, self.num_bins - 1),
-                dtype=torch.float32,
-                device=self.device,
-            )
-
-            X_float_t = (
-                torch.as_tensor(X_np, device=self.device, dtype=torch.float32)
-                .transpose(0, 1)
-                .contiguous()
-            )
-            bin_indices_t = torch.empty(
-                (self.num_features, self.num_samples),
-                dtype=torch.int8,
-                device=self.device,
-            )
-            quantiles = torch.linspace(
-                0, 1, self.num_bins + 1, device=self.device, dtype=torch.float32
-            )[1:-1]
-
-            for f in range(self.num_features):
-                X_f = X_float_t[f]
-                # NaNs are excluded from the edges and get their own bin
-                bin_edges_f = torch.nanquantile(X_f, quantiles, dim=0)
-                bin_edges_f = torch.nan_to_num(bin_edges_f, nan=0.0).contiguous()
-                _get_node_kernel().custom_cuda_binner(
-                    X_f, bin_edges_f, bin_indices_t[f], self.nan_bin
-                )
-                bin_edges[f, :] = bin_edges_f
-
-            bin_indices = bin_indices_t.transpose(0, 1).contiguous()
+            X_gpu = _to_float_gpu(X_np, self.device)
+            # NaNs are excluded from the edges and get their own bin
+            bin_edges = _quantile_edges(X_gpu, self.num_bins)
+            bin_indices = _bin_matrix(X_gpu, bin_edges, self.nan_bin)
             return bin_indices, era_indices, bin_edges, unique_eras
 
     def compute_histograms(self, sample_indices, feature_indices, grad, hess):
@@ -1530,8 +1517,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         obj = self.objective_
         loss_name = "loss" if obj.has_loss() else "mse"
-        train_loss = self._metric_value(loss_name, self.Y_gpu, self.scores, self.tw)
-        self.training_loss.append(train_loss)
+        # The training loss costs a full pass over the training set and a host sync, so by
+        # default it is only computed at evaluation checkpoints
+        train_loss = None
+        if self.record_training_loss == "all":
+            train_loss = self._metric_value(loss_name, self.Y_gpu, self.scores, self.tw)
+            self.training_loss.append(train_loss)
 
         # Evaluate every eval_every_n_trees rounds and always at the last round, so that the
         # trees after the last regular checkpoint are not dropped by the rollback
@@ -1552,6 +1543,13 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.evals_result_["eval"].append(eval_score)
         self.eval_iterations_.append(i + 1)
 
+        if self.record_training_loss == "eval":
+            if isinstance(metric, str) and metric == loss_name and train_score is not None:
+                train_loss = train_score
+            else:
+                train_loss = self._metric_value(loss_name, self.Y_gpu, self.scores, self.tw)
+            self.training_loss.append(train_loss)
+
         if self._is_better(eval_score, self.best_score_):
             self.best_score_ = eval_score
             self.best_iteration_ = i + 1
@@ -1567,57 +1565,36 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         if not self.verbose:
             return
         name = self.eval_metric_name_
-        train_part = (
-            f"Train {name}: {train_score:.6f}" if train_score is not None
-            else f"Train {loss_name}: {train_loss:.6f}"
-        )
-        print(f"🌲 Tree {i+1}/{self.n_estimators} | {train_part} | Eval {name}: {eval_score:.6f}")
+        if train_score is not None:
+            train_part = f"Train {name}: {train_score:.6f} | "
+        elif train_loss is not None:
+            train_part = f"Train {loss_name}: {train_loss:.6f} | "
+        else:
+            train_part = ""
+        print(f"🌲 Tree {i+1}/{self.n_estimators} | {train_part}Eval {name}: {eval_score:.6f}")
 
     # ─── Binning / prediction ───
 
     def bin_data_with_existing_edges(self, X_np):
-        num_samples = X_np.shape[0]
-        X_float_t = (
-            torch.as_tensor(X_np, device=self.device, dtype=torch.float32)
-            .transpose(0, 1)
-            .contiguous()
-        )
-        bin_indices_t = torch.empty(
-            (self.num_features, num_samples), dtype=torch.int8, device=self.device
-        )
-        bin_edges = self.bin_edges.to(self.device)
+        """Internal int8 bins [N, F] of raw features X_np with the fitted bin edges."""
+        if self.bin_edges is None:
+            raise ValueError("This model has no bin edges (it was fitted on pre-binned data).")
         with torch.no_grad():
-            for f in range(self.num_features):
-                _get_node_kernel().custom_cuda_binner(
-                    X_float_t[f],
-                    bin_edges[f].contiguous(),
-                    bin_indices_t[f],
-                    self.nan_bin,
-                )
+            X_gpu = _to_float_gpu(X_np, self.device)
+            return _bin_matrix(X_gpu, self.bin_edges.to(self.device), self.nan_bin)
 
-        return bin_indices_t.transpose(0, 1).contiguous()
-
-    def bin_inference_data(self, X_np):
-        is_integer_type = np.issubdtype(X_np.dtype, np.integer)
-
-        if is_integer_type and X_np.shape[1] == self.num_features:
-            max_vals = X_np.max(axis=0)
-            if np.all(max_vals < self.num_bins):
-                if self.verbose:
-                    print("Detected pre-binned input at predict-time — skipping binning.")
-                is_prebinned = True
-            else:
-                is_prebinned = False
-        else:
-            is_prebinned = False
-
-        if is_prebinned:
-            bin_indices = torch.as_tensor(
-                X_np, device=self.device, dtype=torch.int8
-            ).contiguous()
-        else:
-            bin_indices = self.bin_data_with_existing_edges(X_np)
-        return bin_indices
+    def bin_inference_data(self, X_np, name="X"):
+        """
+        Internal int8 bins [N, F] on the model device: raw features are binned with the fitted
+        edges; for a pre-binned model (prebinned_), X_np must hold bin indices (-1 = missing).
+        """
+        if X_np.ndim != 2 or X_np.shape[1] != self.num_features:
+            raise ValueError(
+                f"{name} must have shape (n_samples, {self.num_features}), got {X_np.shape}."
+            )
+        if self.prebinned_:
+            return _prebinned_to_gpu(X_np, self.num_bins, self.device, name)
+        return self.bin_data_with_existing_edges(X_np)
 
     def _predict_raw_binned(self, bin_indices, num_trees=None):
         """Raw scores [N, K] for binned data, using the first num_trees rounds (None: default model)."""
@@ -1937,10 +1914,13 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             "random_state": self.random_state,
             "warm_start": self.warm_start,
             "monotonic_constraints": self.monotonic_constraints,
+            "prebinned": self.prebinned,
+            "record_training_loss": self.record_training_loss,
             # Trained state
             "objective_": self.objective_,
             "forest": self.forest,
             "bin_edges": to_cpu(self.bin_edges),
+            "prebinned_": self.prebinned_,
             "base_prediction": to_cpu(self.base_prediction),
             "num_features": self.num_features,
             "num_classes": self.num_classes,
@@ -2016,12 +1996,17 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.random_state = state['random_state']
         self.warm_start = state['warm_start']
         self.monotonic_constraints = state.get("monotonic_constraints", None)
+        self.prebinned = state.get("prebinned", None)
+        # Older models used the training-time behaviour of their version: every round
+        self.record_training_loss = state.get("record_training_loss", "all")
 
         # Restore trained state
         self.objective_ = state.get("objective_") or resolve_objective(self.objective)
         self.forest = state['forest']
         bin_edges = state['bin_edges']
         self.bin_edges = bin_edges.to(self.device) if torch.is_tensor(bin_edges) else bin_edges
+        # Models saved before prebinned_ was stored keep binning with their (identity) edges
+        self.prebinned_ = state.get("prebinned_", False)
         self.num_features = state['num_features']
         self.num_classes = state['num_classes']
         self.classes_ = state['classes_']

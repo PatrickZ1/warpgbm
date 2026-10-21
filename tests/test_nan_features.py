@@ -123,3 +123,47 @@ def test_prebinned_integer_input_unaffected():
     model = WarpGBM(objective="regression", n_estimators=20, max_depth=2, num_bins=8, random_state=0)
     model.fit(X, y)
     assert np.mean((model.predict(X) - y) ** 2) < 0.01
+
+
+def _signed_nan_data(seed=7, n=10_000, f=3):
+    """Same data with +NaN and with sign-bit NaN (as numpy's 0/0 gives) in the same positions."""
+    rng = np.random.default_rng(seed)
+    X_pos = rng.normal(size=(n, f)).astype(np.float32)
+    X_pos[: int(0.3 * n), 0] = np.nan
+    X_pos[rng.random(n) < 0.1, 1] = np.nan
+    X_pos[:, 2] = np.nan  # all-NaN column
+    X_neg = X_pos.copy()
+    X_neg[np.isnan(X_neg)] = -np.float32(np.nan)
+    assert np.signbit(X_neg[np.isnan(X_neg)]).all()
+    assert not np.signbit(X_pos[np.isnan(X_pos)]).any()
+    return X_pos, X_neg
+
+
+def test_sign_of_nan_does_not_change_edges():
+    from warpgbm import fit_bins
+
+    X_pos, X_neg = _signed_nan_data()
+    num_bins = 16
+    edges_pos = fit_bins(X_pos, num_bins).cpu().numpy()
+    edges_neg = fit_bins(X_neg, num_bins).cpu().numpy()
+    np.testing.assert_array_equal(edges_neg, edges_pos)
+
+    q = np.linspace(0, 1, num_bins + 1)[1:-1]
+    for f in range(2):
+        np.testing.assert_allclose(edges_neg[f], np.nanquantile(X_neg[:, f], q), rtol=1e-5, atol=1e-6)
+    assert (edges_neg[2] == 0).all()
+    assert (np.diff(edges_neg, axis=1) >= 0).all()
+
+
+def test_sign_of_nan_does_not_change_fit():
+    X_pos, X_neg = _signed_nan_data(8)
+    y = (np.nan_to_num(X_pos[:, 0]) + np.isnan(X_pos[:, 0]) - np.nan_to_num(X_pos[:, 1])).astype(np.float32)
+
+    def fit(X):
+        return WarpGBM(objective="regression", n_estimators=10, max_depth=3, num_bins=16,
+                       random_state=0, verbose=False).fit(X, y)
+
+    pos, neg = fit(X_pos), fit(X_neg)
+    assert torch.equal(neg.bin_edges, pos.bin_edges)
+    assert neg.forest == pos.forest
+    np.testing.assert_array_equal(neg.predict(X_neg), pos.predict(X_pos))

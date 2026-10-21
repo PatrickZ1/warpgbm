@@ -23,10 +23,10 @@ void launch_histogram_kernel_cuda_configurable(
     float grad_scale, float hess_scale, float count_scale,
     int threads_per_block = 256, int rows_per_thread = 1);
 
-void launch_bin_column_kernel(
-    at::Tensor X,
-    at::Tensor bin_edges,
-    at::Tensor bin_indices,
+void launch_bin_matrix_kernel(
+    at::Tensor X,           // [N, F] float32
+    at::Tensor bin_edges,   // [F, E] float32
+    at::Tensor bin_indices, // [N, F] int8
     int nan_bin);
 
 void predict_with_forest(
@@ -42,6 +42,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("compute_histogram3", &launch_histogram_kernel_cuda_configurable, "Histogram Feature Shared Mem");
     m.def("compute_split", &launch_directional_split_kernel, "Best Split (CUDA)");
-    m.def("custom_cuda_binner", &launch_bin_column_kernel, "Custom CUDA binning kernel");
+    m.def("bin_matrix", &launch_bin_matrix_kernel, "Quantile binning of a feature matrix (CUDA)");
     m.def("predict_forest", &predict_with_forest, "CUDA Predictions");
 }
