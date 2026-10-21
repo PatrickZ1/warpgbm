@@ -1,6 +1,8 @@
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <torch/extension.h>
 
 // Flattened tree node layout (NODE_WIDTH floats per node):
 //   0: feature, 1: split_bin, 2: left_id, 3: right_id, 4: is_leaf, 5: leaf_value, 6: nan_left
@@ -57,6 +59,11 @@ void predict_with_forest(
     at::Tensor &out
 )
 {
+    // Run on the tensors' device and the current stream of that device
+    const at::cuda::OptionalCUDAGuard guard(device_of(bin_indices));
+    TORCH_CHECK(bin_indices.is_cuda() && tree_tensor.device() == bin_indices.device()
+                    && out.device() == bin_indices.device(),
+                "bin_indices, tree_tensor and out must be on the same CUDA device");
     TORCH_CHECK(tree_tensor.dim() == 3 && tree_tensor.size(2) == NODE_WIDTH,
                 "tree_tensor must be [T, max_nodes, 7]");
 
@@ -71,7 +78,8 @@ void predict_with_forest(
     int threads_per_block = 256;
     int64_t blocks = (N + threads_per_block - 1) / threads_per_block;
 
-    predict_forest_kernel<<<blocks, threads_per_block>>>(
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    predict_forest_kernel<<<blocks, threads_per_block, 0, stream>>>(
         bin_indices.data_ptr<int8_t>(),
         tree_tensor.data_ptr<float>(),
         N, F, T, max_nodes,

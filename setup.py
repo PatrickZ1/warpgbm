@@ -29,10 +29,10 @@ def get_extensions():
             )
         )
     else:
-        if torch_available:
-            print("PyTorch installed but CUDA not available. Skipping CUDA extensions.")
-        else:
-            print("PyTorch not found. Skipping CUDA extensions.")
+        # Only meant for building the source distribution: WarpGBM has no CPU code path, so a
+        # package installed without the extension cannot train or predict
+        reason = "CUDA not available" if torch_available else "PyTorch not found"
+        print(f"{reason}: skipping the CUDA extension. WarpGBM requires it to train or predict.")
     return extensions
 
 # Read version

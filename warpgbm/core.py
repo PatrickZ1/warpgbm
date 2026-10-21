@@ -81,6 +81,9 @@ def _get_node_kernel():
 
 
 class WarpGBM(BaseEstimator, RegressorMixin):
+    # Defaults for instances pickled by versions without these attributes
+    verbose = True
+    _rng = None
 
     def __init__(
         self,
@@ -100,6 +103,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         warm_start=False,
         monotonic_constraints=None,
         min_sum_hessian=1e-3,
+        verbose=True,
     ):
         # Validate arguments
         self._validate_hyperparams(
@@ -113,6 +117,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             threads_per_block=threads_per_block,
             rows_per_thread=rows_per_thread,
             L2_reg=L2_reg,
+            device=device,
             colsample_bytree=colsample_bytree,
             monotonic_constraints=monotonic_constraints,
             min_sum_hessian=min_sum_hessian,
@@ -149,6 +154,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.random_state = random_state
         self.warm_start = warm_start
         self.monotonic_constraints = monotonic_constraints
+        self.verbose = verbose
+        self._rng = None
         self.label_encoder = None
         self.feature_importance_ = None
         self.per_era_feature_importance_ = None
@@ -168,6 +175,17 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.train_predictions_ = None
 
     def _validate_hyperparams(self, **kwargs):
+        # All kernels are CUDA-only; there is no CPU code path
+        device = kwargs["device"]
+        try:
+            device_type = torch.device(device).type
+        except (RuntimeError, TypeError) as e:
+            raise ValueError(f"Invalid device {device!r}.") from e
+        if device_type != "cuda":
+            raise ValueError(
+                f"WarpGBM requires a CUDA device ('cuda' or 'cuda:N'), got {device!r}."
+            )
+
         # Validate objective
         objective = kwargs["objective"]
         if isinstance(objective, str):
@@ -788,16 +806,13 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         if X_eval is not None and y_eval is not None and sample_weight_eval is not None:
             sample_weight_eval = self._normalize_sample_weight(sample_weight_eval)
 
-        # Set random seed for reproducibility
+        # Per-model generator (fresh per fit): fit never touches the global RNG state, so
+        # concurrent fits in several threads / on several GPUs stay reproducible
+        self._rng = torch.Generator(device=self.device)
         if self.random_state is not None:
-            torch.manual_seed(self.random_state)
-            np.random.seed(self.random_state)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed(self.random_state)
-                torch.cuda.manual_seed_all(self.random_state)
-                # Note: Some CUDA operations may still be non-deterministic
-                # For full determinism, set: torch.use_deterministic_algorithms(True)
-                # but this may impact performance
+            self._rng.manual_seed(self.random_state)
+        else:
+            self._rng.seed()
 
         continuing = self.warm_start and self._is_fitted
 
@@ -818,7 +833,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 )
             if self._trees_trained >= self.n_estimators:
                 # Already have all requested trees
-                print(f"Model already has {self._trees_trained} trees (n_estimators={self.n_estimators}). No additional training needed.")
+                if self.verbose:
+                    print(f"Model already has {self._trees_trained} trees (n_estimators={self.n_estimators}). No additional training needed.")
+                self._rng = None
                 return self
             # The best round is tracked per fit (over this fit's evaluations)
             self.best_iteration_ = None
@@ -937,6 +954,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._eval_aux = None
         self._train_aux = None
         self._best_train_scores = None
+        self._rng = None
 
         gc.collect()
 
@@ -1004,7 +1022,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             is_integer_type = np.issubdtype(X_np.dtype, np.integer)
 
             if is_integer_type and np.all(X_np.max(axis=0) < self.num_bins):
-                print("Detected pre-binned integer input — skipping quantile binning.")
+                if self.verbose:
+                    print("Detected pre-binned integer input — skipping quantile binning.")
                 bin_indices = torch.as_tensor(X_np, device=self.device).to(
                     dtype=torch.int8
                 ).contiguous()
@@ -1390,7 +1409,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             neg_grad = -g
 
             if self.colsample_bytree < 1.0:
-                self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
+                self.feat_indices_tree = torch.randperm(
+                    self.num_features, device=self.device, dtype=torch.int32, generator=self._rng
+                )[:k]
 
             if strategy == PER_OUTPUT:
                 round_trees = []
@@ -1425,10 +1446,11 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._is_fitted = True
         self._update_importance_attributes()
 
-        if strategy == PER_OUTPUT:
-            print(f"Finished training {self.objective_.name} forest. Total rounds: {self._trees_trained} ({self._trees_trained * self.num_outputs} trees)")
-        else:
-            print(f"Finished training {self.objective_.name} forest. Total trees: {self._trees_trained}")
+        if self.verbose:
+            if strategy == PER_OUTPUT:
+                print(f"Finished training {self.objective_.name} forest. Total rounds: {self._trees_trained} ({self._trees_trained * self.num_outputs} trees)")
+            else:
+                print(f"Finished training {self.objective_.name} forest. Total trees: {self._trees_trained}")
 
     # ─── Evaluation ───
 
@@ -1542,6 +1564,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             if self._evals_since_best >= self.early_stopping_rounds:
                 self.stop = True
 
+        if not self.verbose:
+            return
         name = self.eval_metric_name_
         train_part = (
             f"Train {name}: {train_score:.6f}" if train_score is not None
@@ -1579,7 +1603,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         if is_integer_type and X_np.shape[1] == self.num_features:
             max_vals = X_np.max(axis=0)
             if np.all(max_vals < self.num_bins):
-                print("Detected pre-binned input at predict-time — skipping binning.")
+                if self.verbose:
+                    print("Detected pre-binned input at predict-time — skipping binning.")
                 is_prebinned = True
             else:
                 is_prebinned = False
@@ -1948,7 +1973,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         with open(path, 'wb') as f:
             pickle.dump(state, f)
 
-        print(f"Model saved to {path}")
+        if self.verbose:
+            print(f"Model saved to {path}")
 
     def load_model(self, path):
         """
@@ -2053,7 +2079,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.monotonic_required_split_direction_gpu_ = None
         self._invalidate_prediction_cache()
 
-        print(f"Model loaded from {path} ({self._trees_trained} trees)")
+        if self.verbose:
+            print(f"Model loaded from {path} ({self._trees_trained} trees)")
 
         return self
 

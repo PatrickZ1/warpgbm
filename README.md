@@ -484,13 +484,27 @@ WarpGBM(
     min_sum_hessian=1e-3,          # Min hessian sum per child for an output to contribute to the gain
     L2_reg=1e-6,                   # L2 leaf regularization
     colsample_bytree=1.0,          # Feature subsample ratio per tree
-    random_state=None,             # Random seed for reproducibility
+    random_state=None,             # Seed of the model's own generator (fit never touches global RNGs)
     warm_start=False,              # If True, continue training from existing trees
     monotonic_constraints=None,    # Optional: vector or dict {feature_idx: -1|0|1}
     threads_per_block=64,          # CUDA block size (tune for your GPU)
     rows_per_thread=4,             # Rows processed per thread
-    device='cuda'                  # 'cuda' or 'cpu' (GPU strongly recommended)
+    device='cuda',                 # 'cuda' (current device) or 'cuda:N'; training requires CUDA
+    verbose=True,                  # False silences all training / save / load messages
 )
+```
+
+Models can be trained on different GPUs, or concurrently in several threads, without switching
+the current device; with the same `random_state` the forests are identical to sequential fits:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+def train(device):
+    return WarpGBM(device=device, colsample_bytree=0.8, random_state=42, verbose=False).fit(X, y)
+
+with ThreadPoolExecutor(2) as pool:
+    model_a, model_b = pool.map(train, ["cuda:0", "cuda:1"])
 ```
 
 ### Training Methods
@@ -637,7 +651,13 @@ Built on the shoulders of PyTorch, scikit-learn, LightGBM, XGBoost, and the CUDA
 
 ## 📝 Version History
 
-### v2.4.0 (Current)
+### v2.5.0 (Current)
+- 🖥️ `device="cuda:N"` works from any thread without switching the current device; kernels run on the current stream of the tensors' device
+- 🎲 Per-model random generator: concurrent fits are reproducible and `fit` no longer seeds the global torch / numpy RNGs
+- 🔇 `verbose=False` silences all messages
+- 🚫 Non-CUDA devices (`device="cpu"`) are rejected at construction; there is no CPU code path
+
+### v2.4.0
 - ⏪ Early stopping rolls back to the best round: `best_iteration_`, `best_score_`, `evals_result_`; `predict(..., num_trees=)`, `truncate()`
 - 🔍 Feature importances follow the used trees (`num_trees=`; per-era at the best round and all rounds)
 - 📏 `Metric(fn, higher_is_better=True)`; `accuracy` / `corr` are maximized and reported as natural values; per-row `eval_aux` / `train_aux` for callable metrics

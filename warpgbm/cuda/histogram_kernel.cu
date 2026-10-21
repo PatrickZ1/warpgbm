@@ -1,6 +1,8 @@
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <torch/extension.h>
 
 // Histogram layouts:
 //   grad_hist / hess_hist : [E, F, B, K]  (K = number of gradient channels / outputs)
@@ -196,6 +198,15 @@ void launch_histogram_kernel_cuda_configurable(
     int threads_per_block = 256,
     int rows_per_thread = 1)
 {
+    // Run on the tensors' device and the current stream of that device; this also makes the
+    // workspace allocation and the shared-memory query below refer to that device
+    const at::cuda::OptionalCUDAGuard guard(device_of(bin_indices));
+    const std::initializer_list<const at::Tensor *> tensors = {
+        &grads, &hess, &row_weight, &sample_indices, &feature_indices,
+        &era_indices, &grad_hist, &hess_hist, &count_hist};
+    for (const at::Tensor *t : tensors)
+        TORCH_CHECK(bin_indices.is_cuda() && t->device() == bin_indices.device(),
+                    "histogram kernel tensors must be on the same CUDA device");
     TORCH_CHECK(grads.is_contiguous() && hess.is_contiguous(), "grads and hess must be contiguous");
     TORCH_CHECK(grads.dim() == 2 && hess.sizes() == grads.sizes(), "grads and hess must be [N, K] with equal shapes");
     TORCH_CHECK(grad_hist.dim() == 4 && grad_hist.size(3) == grads.size(1), "grad_hist must be [E, F, B, K]");
@@ -255,9 +266,10 @@ void launch_histogram_kernel_cuda_configurable(
     int max_shared = 0;
     cudaDeviceGetAttribute(&max_shared, cudaDevAttrMaxSharedMemoryPerBlock, device);
 
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     if (shared_mem_bytes <= max_shared)
     {
-        histogram_shared_kernel<<<blocks, threads, shared_mem_bytes>>>(
+        histogram_shared_kernel<<<blocks, threads, shared_mem_bytes, stream>>>(
             bin_indices.data_ptr<int8_t>(),
             grads.data_ptr<float>(),
             hess.data_ptr<float>(),
@@ -274,7 +286,7 @@ void launch_histogram_kernel_cuda_configurable(
     }
     else
     {
-        histogram_global_kernel<<<blocks, threads>>>(
+        histogram_global_kernel<<<blocks, threads, 0, stream>>>(
             bin_indices.data_ptr<int8_t>(),
             grads.data_ptr<float>(),
             hess.data_ptr<float>(),
@@ -295,7 +307,7 @@ void launch_histogram_kernel_cuda_configurable(
 
     const int conv_threads = 256;
     int64_t conv_blocks = (2 * n_gh + n_c + conv_threads - 1) / conv_threads;
-    fixed_to_float_kernel<<<conv_blocks, conv_threads>>>(
+    fixed_to_float_kernel<<<conv_blocks, conv_threads, 0, stream>>>(
         grad_acc,
         grad_hist.data_ptr<float>(),
         hess_hist.data_ptr<float>(),

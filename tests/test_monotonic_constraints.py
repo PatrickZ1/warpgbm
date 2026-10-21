@@ -59,7 +59,6 @@ def test_monotonic_decreasing_regression_without_eras():
         num_bins=32,
         monotonic_constraints=[-1, 0],
         random_state=9,
-        # device="cpu",
     )
     model.fit(X, y)
 
@@ -81,7 +80,6 @@ def test_monotonic_constraints_vector_and_dict_equivalent():
         learning_rate=0.1,
         num_bins=24,
         random_state=21,
-        # device="cpu",
     )
 
     model_vector = WarpGBM(monotonic_constraints=[1, 0], **common_params)

@@ -1,4 +1,6 @@
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -143,6 +145,11 @@ void launch_directional_split_kernel(
     at::Tensor &per_era_direction, // [E, F, 2 * (B - 1)]
     int threads = 128)
 {
+    // Run on the tensors' device and the current stream of that device; this also makes the
+    // shared-memory query below refer to that device
+    const at::cuda::OptionalCUDAGuard guard(device_of(G));
+    for (const at::Tensor *t : std::initializer_list<const at::Tensor *>{&H, &C, &per_era_gain, &per_era_direction})
+        TORCH_CHECK(G.is_cuda() && t->device() == G.device(), "split kernel tensors must be on the same CUDA device");
     TORCH_CHECK(G.dim() == 4 && H.sizes() == G.sizes(), "G and H must be [E, F, B, K]");
     TORCH_CHECK(C.dim() == 3, "C must be [E, F, B]");
     TORCH_CHECK(G.is_contiguous() && H.is_contiguous() && C.is_contiguous(), "histograms must be contiguous");
@@ -168,7 +175,8 @@ void launch_directional_split_kernel(
     bool use_shared = shared_bytes <= max_shared;
 
     dim3 blocks(F, E);
-    directional_split_kernel<<<blocks, block_threads, use_shared ? shared_bytes : 0>>>(
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    directional_split_kernel<<<blocks, block_threads, use_shared ? shared_bytes : 0, stream>>>(
         G.data_ptr<float>(),
         H.data_ptr<float>(),
         C.data_ptr<float>(),

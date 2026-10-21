@@ -1,4 +1,6 @@
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -41,6 +43,12 @@ void launch_bin_column_kernel(
     at::Tensor bin_indices, // [N]
     int nan_bin)
 {
+    // Run on the tensors' device and the current stream of that device, independent of the
+    // caller's current device
+    const at::cuda::OptionalCUDAGuard guard(device_of(X));
+    TORCH_CHECK(X.is_cuda() && bin_edges.device() == X.device() && bin_indices.device() == X.device(),
+                "X, bin_edges and bin_indices must be on the same CUDA device");
+
     const int N = X.size(0);
     const int B = bin_edges.size(0);
 
@@ -50,7 +58,8 @@ void launch_bin_column_kernel(
     const int threads = 256;
     const int blocks = (N + threads - 1) / threads;
 
-    bin_column_kernel<<<blocks, threads>>>(
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    bin_column_kernel<<<blocks, threads, 0, stream>>>(
         X.data_ptr<float>(),
         bin_edges.data_ptr<float>(),
         bin_indices.data_ptr<int8_t>(),

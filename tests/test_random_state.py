@@ -31,11 +31,9 @@ def test_random_state_regression():
     model2.fit(X, y)
     preds2 = model2.predict(X)
     
-    # Predictions should be very similar (allow small numerical differences from GPU ops)
-    max_diff = np.abs(preds1 - preds2).max()
-    mean_diff = np.abs(preds1 - preds2).mean()
-    assert np.allclose(preds1, preds2, rtol=1e-3, atol=1e-3), f"Predictions differ too much (max_diff={max_diff:.6f})"
-    print(f"✓ Regression: highly similar predictions with random_state=42 (max_diff={max_diff:.6f})")
+    # Histograms and predictions are deterministic, so fits are bit-reproducible
+    assert np.array_equal(preds1, preds2), f"Predictions differ (max_diff={np.abs(preds1 - preds2).max():.6g})"
+    print("✓ Regression: identical predictions with random_state=42")
     
     # Train model with different random_state
     model3 = WarpGBM(
@@ -85,10 +83,8 @@ def test_random_state_multiclass():
     model2.fit(X, y)
     probs2 = model2.predict_proba(X)
     
-    # Probabilities should be very similar (allow slightly more tolerance for multiclass GPU ops)
-    max_diff = np.abs(probs1 - probs2).max()
-    assert np.allclose(probs1, probs2, rtol=1e-2, atol=1e-2), f"Probabilities differ too much (max_diff={max_diff:.6f})"
-    print(f"✓ Multiclass: highly similar predictions with random_state=42 (max_diff={max_diff:.6f})")
+    assert np.array_equal(probs1, probs2), f"Probabilities differ (max_diff={np.abs(probs1 - probs2).max():.6g})"
+    print("✓ Multiclass: identical predictions with random_state=42")
     
     # Train model with different random_state
     model3 = WarpGBM(
@@ -133,6 +129,47 @@ def test_no_random_state_with_colsample():
     # Just verify both models trained successfully (no assertion on difference)
     # since GPU randomness without seed is environment-dependent
     print(f"✓ random_state=None: allows uncontrolled randomness when colsample_bytree < 1.0")
+
+
+
+def test_fit_does_not_touch_global_rng():
+    """fit draws from a per-model generator and leaves the global RNG states alone"""
+    import torch
+
+    X, y = make_regression(n_samples=300, n_features=10, random_state=0)
+    X = X.astype(np.float32)
+    y = y.astype(np.float32)
+
+    for random_state in (7, None):
+        cpu_state = torch.get_rng_state()
+        cuda_state = torch.cuda.get_rng_state()
+        np_state = np.random.get_state()
+
+        WarpGBM(
+            max_depth=3, n_estimators=10, colsample_bytree=0.5, random_state=random_state, verbose=False
+        ).fit(X, y)
+
+        assert torch.equal(torch.get_rng_state(), cpu_state)
+        assert torch.equal(torch.cuda.get_rng_state(), cuda_state)
+        np_after = np.random.get_state()
+        assert np_after[0] == np_state[0] and np.array_equal(np_after[1], np_state[1])
+        assert np_after[2:] == np_state[2:]
+
+
+def test_random_state_ignores_global_seed():
+    """The result depends on random_state only, not on draws from the global RNG in between"""
+    import torch
+
+    X, y = make_regression(n_samples=300, n_features=10, random_state=0)
+    X = X.astype(np.float32)
+    y = y.astype(np.float32)
+    params = dict(max_depth=3, n_estimators=20, colsample_bytree=0.5, random_state=3, verbose=False)
+
+    preds1 = WarpGBM(**params).fit(X, y).predict(X)
+    torch.manual_seed(12345)
+    torch.randperm(100, device="cuda")
+    preds2 = WarpGBM(**params).fit(X, y).predict(X)
+    assert np.array_equal(preds1, preds2)
 
 
 if __name__ == "__main__":

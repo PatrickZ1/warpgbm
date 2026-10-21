@@ -162,6 +162,24 @@ load (tested).
 * Training-time evaluation adds only the newest round to cached eval scores instead of
   re-flattening the forest.
 
+### 3.6 Several GPUs and concurrent fits (v2.5.0)
+
+* **Per-model RNG.** `fit` creates `self._rng = torch.Generator(device=self.device)`, seeded
+  with `random_state` (or a nondeterministic seed when it is `None`), fresh on every fit
+  including warm starts. The `colsample_bytree` draws (`torch.randperm`) use it, and it is the
+  only random draw in training. The generator is released at the end of `fit` and not pickled.
+  `fit` no longer calls `torch.manual_seed`, `np.random.seed` or `torch.cuda.manual_seed(_all)`.
+* **Device guard.** Every launcher in `warpgbm/cuda/*.cu` (binner, histogram including the
+  fixed-point conversion, split, predict) starts with
+  `at::cuda::OptionalCUDAGuard guard(device_of(<first input>))`, checks that all its tensors
+  are on that device, and launches on `at::cuda::getCurrentCUDAStream()`. The histogram
+  workspace and the shared-memory size queries therefore refer to the tensors' device.
+  `WarpGBM(device="cuda:1")` works from any thread without `torch.cuda.set_device`.
+* Together with the deterministic histograms (§3.4), models with the same `random_state` fitted
+  concurrently in two threads (on one GPU or on two) give forests identical to sequential fits.
+* **`verbose`** constructor parameter (default `True`) gates every `print` in `core.py`. It is
+  not saved by `save_model`; the loading instance's value applies.
+
 ---
 
 ## 4. Behaviour changes to be aware of
@@ -180,6 +198,7 @@ load (tested).
 | tree nodes | `"feature"` was a 0-d CUDA tensor | Python int, plus a `"nan_left"` flag |
 | `predict` | float atomics over trees (last-bit noise between calls) | deterministic summation order |
 | CUDA API (`node_kernel`) | — | changed signatures: histogram (K channels, count, fixed-point scales), split (`[E,F,B,K]`, count, `min_sum_hessian`, 2·B candidates), binner (`nan_bin`), predict (`nan_bin`, 7-column trees) |
+| global RNG state | `fit` seeded torch / numpy / CUDA global RNGs with `random_state` | untouched; code that relied on this side effect must seed itself. With `random_state=None` the column draws no longer depend on earlier global seeding |
 | single-output regression without NaNs/weights | — | same predictions as before up to float rounding (max abs diff 6e-5 at prediction scale 540) |
 
 ---
@@ -210,8 +229,8 @@ pyenv), installed with `pip install --no-build-isolation`.
 
 ## 6. Known limitations
 
-* Training requires CUDA (the kernels have no CPU path), despite `device="cpu"` being mentioned
-  upstream.
+* Training and prediction require CUDA; there is no CPU code path. Since v2.5.0 the constructor
+  rejects non-CUDA devices such as `device="cpu"` (mentioned upstream) with a `ValueError`.
 * For classifiers, monotonic constraints apply to each class's logit, not to the probabilities.
 * Custom losses must be per sample (a row's loss depends only on that row). Dataset-level losses
   such as a Pearson correlation over all rows are not supported: they were tried and did not
