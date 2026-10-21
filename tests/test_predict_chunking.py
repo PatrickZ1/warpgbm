@@ -52,31 +52,39 @@ def test_flatten_cache_reused_and_invalidated_on_retraining():
 
     model = _build_regression_model(X, y, n_estimators=20)
 
+    # Every round is flattened (packed) once; later predictions reuse it
     call_counter = {"calls": 0}
-    original_flatten = model.flatten_tree
+    original_pack = model._pack_tree
 
-    def counted_flatten(tree, max_nodes):
+    def counted_pack(tree, max_nodes, leaf_width):
         call_counter["calls"] += 1
-        return original_flatten(tree, max_nodes)
+        return original_pack(tree, max_nodes, leaf_width)
 
-    model.flatten_tree = counted_flatten
+    model._pack_tree = counted_pack
 
     model.predict(X[:200])
-    first_predict_calls = call_counter["calls"]
-    assert first_predict_calls > 0
+    assert call_counter["calls"] == 20
 
     model.predict(X[200:400])
-    assert call_counter["calls"] == first_predict_calls
+    model.predict(X[:50], num_trees=7)
+    model.staged_predict(X[:50], [3, 9, 20])
+    assert call_counter["calls"] == 20
 
+    # Warm start: only the new rounds are packed
     model.warm_start = True
     model.n_estimators = 30
     model.fit(X, y)
     model.predict(X[:200])
-    after_continue_calls = call_counter["calls"]
-    assert after_continue_calls > first_predict_calls
+    assert call_counter["calls"] == 30
 
+    # A fresh fit replaces the forest: everything is packed again
     model.warm_start = False
     model.n_estimators = 15
     model.fit(X, y)
     model.predict(X[:200])
-    assert call_counter["calls"] > after_continue_calls
+    assert call_counter["calls"] == 45
+
+    # truncate keeps the packed rounds it retains
+    model.truncate(10)
+    model.predict(X[:200])
+    assert call_counter["calls"] == 45

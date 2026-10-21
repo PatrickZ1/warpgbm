@@ -151,50 +151,58 @@ def test_F_classification_predict_uses_training_prior(objective):
         assert abs(proba[:, k].mean() - (y == k).mean()) < 0.02
 
 
-def _reference_histograms(bin_indices, grad, hess, row_weight, sample_idx, feat_idx, era, E, B):
-    F = len(feat_idx)
-    K = grad.shape[1]
-    G = torch.zeros(E, F, B, K, device=grad.device)
-    H = torch.zeros_like(G)
-    C = torch.zeros(E, F, B, device=grad.device)
-    s = sample_idx.long()
+def _reference_histograms(bins_fm, values, rows, feat_idx, era, E, B):
+    """[F, E, B, C] float64 sums of values [N, C] over rows, per feature/era/bin."""
+    out = torch.zeros(len(feat_idx), E, B, values.shape[1], dtype=torch.float64, device=values.device)
+    v = values[rows].double()
+    e = era[rows].long()
     for j, f in enumerate(feat_idx.long().tolist()):
-        bins = bin_indices[s, f].long()
-        e = era[s].long()
-        flat = e * B + bins
-        for k in range(K):
-            G[:, j, :, k] = torch.zeros(E * B, device=grad.device).index_add_(0, flat, grad[s, k]).view(E, B)
-            H[:, j, :, k] = torch.zeros(E * B, device=grad.device).index_add_(0, flat, hess[s, k]).view(E, B)
-        C[:, j, :] = torch.zeros(E * B, device=grad.device).index_add_(0, flat, row_weight[s]).view(E, B)
-    return G, H, C
+        flat = e * B + bins_fm[f, rows].long()
+        out[j].view(E * B, -1).index_add_(0, flat, v)
+    return out
 
 
-@pytest.mark.parametrize("num_eras", [3, 500])  # 500 eras exceed shared memory -> global fallback
-def test_G_histogram_kernel_matches_reference(num_eras):
+@pytest.mark.parametrize("deterministic", [True, False])
+@pytest.mark.parametrize(
+    "num_eras, K, Kh",
+    [(3, 3, 3), (3, 20, 0), (500, 3, 3)],  # 500 eras exceed shared memory -> global fallback
+)
+def test_G_histogram_kernel_matches_reference(num_eras, K, Kh, deterministic):
     torch.manual_seed(0)
-    N, F_master, B, K = 5000, 6, 33, 3
+    N, F_master, B = 5000, 6, 33
     dev = "cuda"
-    bin_indices = torch.randint(0, B, (N, F_master), dtype=torch.int8, device=dev)
+    bins_fm = torch.randint(0, B, (F_master, N), dtype=torch.int8, device=dev)
     grad = torch.randn(N, K, device=dev)
-    hess = torch.rand(N, K, device=dev)
+    hess = torch.rand(N, Kh, device=dev)
     row_weight = torch.rand(N, device=dev)
     era = torch.randint(0, num_eras, (N,), dtype=torch.int32, device=dev)
-    sample_idx = torch.randperm(N, device=dev)[:3000].to(torch.int32)
     feat_idx = torch.tensor([4, 0, 2], dtype=torch.int32, device=dev)
+    # Two segments (nodes) of sorted rows, written to slots 1 and 0
+    perm = torch.randperm(N, device=dev)
+    seg_a, seg_b = perm[:1500].sort().values, perm[1500:4000].sort().values
+    order = torch.cat([seg_a, seg_b]).to(torch.int32)
 
-    G = torch.zeros(num_eras, 3, B, K, device=dev)
-    H = torch.zeros_like(G)
-    C = torch.zeros(num_eras, 3, B, device=dev)
-    scales = [_WarpGBM._fixed_point_scale(t, 64 * 4) for t in (grad, hess, row_weight)]
-    _get_node_kernel().compute_histogram3(
-        bin_indices, grad, hess, row_weight, sample_idx, feat_idx, era, G, H, C, B, *scales, 64, 4
+    model = _WarpGBM()
+    model._tile_rows_ = T = 1024
+    scales = torch.stack([model._device_scale(t) for t in (grad, hess, row_weight)])
+    i32 = lambda v: torch.tensor(v, dtype=torch.int32, device=dev)
+    tiles = [(len(seg_a) + T - 1) // T, (len(seg_b) + T - 1) // T]
+    C = K + Kh + 1
+    hist = torch.zeros(
+        (2, 3, num_eras, B, C), device=dev, dtype=torch.int64 if deterministic else torch.float32
     )
-    G_ref, H_ref, C_ref = _reference_histograms(
-        bin_indices, grad, hess, row_weight, sample_idx, feat_idx, era, num_eras, B
+    _get_node_kernel().histogram_level(
+        bins_fm, grad, hess, row_weight, order,
+        i32([0, len(seg_a)]), i32([len(seg_a), len(seg_b)]), i32([1, 0]),
+        i32([0, tiles[0], tiles[0] + tiles[1]]), feat_idx, era, hist, scales,
+        sum(tiles) + 2, T,
     )
-    torch.testing.assert_close(G, G_ref, rtol=1e-4, atol=1e-4)
-    torch.testing.assert_close(H, H_ref, rtol=1e-4, atol=1e-4)
-    torch.testing.assert_close(C, C_ref, rtol=1e-4, atol=1e-4)
+    if deterministic:
+        hist = _WarpGBM._acc_to_float(hist, scales, K, Kh)
+    values = torch.cat([grad, hess, row_weight[:, None]], dim=1)
+    for slot, rows in ((1, seg_a), (0, seg_b)):
+        ref = _reference_histograms(bins_fm, values, rows.long(), feat_idx, era, num_eras, B)
+        torch.testing.assert_close(hist[slot].double(), ref, rtol=1e-4, atol=1e-4)
 
 
 def test_G_many_eras_training_learns():

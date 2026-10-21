@@ -17,6 +17,7 @@ In this version, we have made the following changes:
 - **Explicit pre-binned input** (`prebinned=True`, missing = -1) and WarpGBM's own binning as public functions (`warpgbm.fit_bins` / `warpgbm.apply_bins`)
 - **Early stopping with rollback**: the best evaluated round is recorded (`best_iteration_`, `best_score_`); predictions, feature importances and in-sample `train_predictions_` use the best model; higher-is-better metrics, custom metrics with per-row auxiliary data (`eval_aux` / `train_aux`)
 - Deterministic training (fixed-point histograms), a global-memory fallback for many eras, and several bug fixes (multi-output split gain, `min_child_weight` with classification, class priors at prediction, weighted base score)
+- **Much faster training and prediction on small, wide data** (v2.7.0): level-wise tree growth without host syncs, replayed as CUDA graphs; a rewritten histogram kernel; `deterministic=False` for a further 10–30 %; `staged_predict` for many round counts in one pass; and `predict(..., device="cpu")` for low-latency predictions of a few rows. 10k rows × 1k features × 20 outputs: 53 → 6.6 ms per tree (`deterministic=True`) or 5.1 ms (`False`); single-row prediction 2.9 → 0.18 ms (CPU)
 
 A full review of all changes, the bugs that were fixed and the behaviour changes is in [docs/FORK_CHANGES.md](docs/FORK_CHANGES.md).
 
@@ -515,15 +516,21 @@ WarpGBM(
     random_state=None,             # Seed of the model's own generator (fit never touches global RNGs)
     warm_start=False,              # If True, continue training from existing trees
     monotonic_constraints=None,    # Optional: vector or dict {feature_idx: -1|0|1}
-    threads_per_block=64,          # CUDA block size (tune for your GPU)
-    rows_per_thread=4,             # Rows processed per thread
     device='cuda',                 # 'cuda' (current device) or 'cuda:N'; training requires CUDA
     verbose=True,                  # False silences all training / save / load messages
     prebinned=None,                # True: integer X are bin indices 0..num_bins-1, -1 = missing (no binning);
                                    #   False: always quantile-bin; None: auto-detect at fit (legacy)
     record_training_loss='eval',   # training_loss at eval checkpoints ('eval'), every round ('all') or 'none'
+    deterministic=True,            # True: bit-reproducible fits (int64 fixed-point histograms);
+                                   #   False: float histograms, ~10-30% faster, results vary in the last bits
 )
 ```
+
+Split semantics worth knowing when tuning: `min_child_weight` applies to the row weights of a child
+**in every era**; the split gain is summed over the outputs and averaged over eras (so the scale of
+`min_split_gain` depends on K, era sizes and target variance); with several eras an era's direction
+counts only if all outputs agree, and only candidates with the node's maximal agreement qualify;
+`L2_reg` is the λ in G / (H + λ).
 
 Models can be trained on different GPUs, or concurrently in several threads, without switching
 the current device; with the same `random_state` the forests are identical to sequential fits:
@@ -585,6 +592,14 @@ raw = model.predict_raw(X)
 # All prediction methods take num_trees (boosting rounds); None = default model
 # (best_iteration_ after early stopping, else all trained rounds)
 all_trees = model.predict(X, num_trees=model.num_trees_)
+
+# Several round counts in one pass: shape (len(rounds), n_samples[, K]); entry p equals
+# predict(X, num_trees=rounds[p]) exactly. Also staged_predict_raw / staged_predict_proba
+staged = model.staged_predict(X, rounds=[10, 20, 50, 100])
+
+# Low latency for a few rows: device="cpu" predicts with NumPy, without any CUDA call
+# (identical raw scores; works on all prediction methods)
+one_row = model.predict(X[:1], device="cpu")
 
 # Feature importance: gain-based (like LightGBM/XGBoost), of the default model
 importances = model.get_feature_importance(normalize=True)  # sums to 1.0
@@ -685,7 +700,15 @@ Built on the shoulders of PyTorch, scikit-learn, LightGBM, XGBoost, and the CUDA
 
 ## 📝 Version History
 
-### v2.6.0 (Current)
+### v2.7.0 (Current)
+- 🚀 Level-wise tree growth without host syncs, replayed as a CUDA graph per tree, pipelined rounds; rewritten histogram (feature-major bins, all outputs per block, feature groups), split and prediction kernels. Small, wide data trains 5–15× faster
+- 🎛️ `deterministic` (default `True`): `False` uses float histograms for a further 10–30 % at the cost of bit-reproducibility
+- 🪜 `staged_predict` / `staged_predict_raw` / `staged_predict_proba`: predictions after several round counts from one pass
+- 🧮 `device="cpu"` on all prediction methods: NumPy prediction for a few rows (~0.15 ms), identical raw scores
+- 📦 The forest is flattened once per round and cached; `predict(num_trees=c)` no longer re-flattens
+- ⚠️ Forests are close to, but not bit-identical with, v2.6.0; the `threads_per_block` / `rows_per_thread` parameters were removed (the kernels choose their launch configuration)
+
+### v2.6.0
 - 🧱 `prebinned=True`: explicit pre-binned input with `-1` for missing values, used as-is in `fit` / `X_eval` / `predict*`; float or out-of-range input raises; stored as `prebinned_`
 - 🔢 `warpgbm.fit_bins` / `warpgbm.apply_bins`: WarpGBM's binning as public GPU functions; the binning kernel now bins a whole matrix in one launch
 - ⏱️ `record_training_loss` (default `'eval'`): the training loss is computed at eval checkpoints only, saving a full training-set pass and a host sync per round

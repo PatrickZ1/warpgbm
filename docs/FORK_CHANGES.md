@@ -226,6 +226,182 @@ load (tested).
 * `_get_node_kernel` moved to `warpgbm/cuda/__init__.py` (`warpgbm.core._get_node_kernel` still
   imports). `predict*` now checks the feature count of its input.
 
+### 3.8 Training and prediction performance, `deterministic` switch (v2.7.0)
+
+The target workload is small, wide data: ~10k rows, ~1k features, K = 20 outputs, a few eras.
+v2.6.0 spent most of its time there in the histogram kernel and in per-node host work.
+`benchmarks/bench_small_wide.py` reproduces the numbers below.
+
+**Diagnosis (v2.6.0, GTX 1660 Ti, 10k × 1000, K = 20, 3 eras, 16 bins, depth 4, colsample 0.4).**
+53 ms per tree. 84 % of the GPU time went to the histogram kernel. One block per feature read the
+row-major `[N, F]` bins one byte per thread (stride F, uncoalesced), once per output (grid.z = K).
+Every 256-row block also flushed `E·B·3` 64-bit global atomics. Each node then added several host
+syncs (best-split `.tolist()`, boolean indexing, the fixed-point scales). Prediction re-flattened
+the forest in Python for every new `num_trees` (370 ms for 80 trees × 20 outputs) and launched one
+kernel per output.
+
+**Training engine (both modes).**
+
+* **Level-wise growth.** All nodes of a depth are processed together, with a few kernel launches
+  and no host sync (`_grow_tree_device`):
+  1. node totals (`node_sums`) give the leaf values and the monotone bounds;
+  2. histograms of the level;
+  3. `level_split`: the candidates of all nodes;
+  4. `select_split`: the best split per node;
+  5. rows move to their child (heap numbering).
+
+  The trees are full-depth with independent node splits, so this grows the same trees as the
+  former depth-first recursion. The tree is copied to the host once, at the end, as one record
+  tensor. Python builds the same node dicts as before, so pickles, importances, `truncate` and
+  warm start are unchanged.
+* **CUDA graphs.** Every tree of a fit launches the same kernels on tensors of the same shapes. The
+  second tree of each shape is captured as a CUDA graph; later trees copy their gradients,
+  hessians and sampled features into its static buffers and replay it. That is one launch instead
+  of about 100 small ones. A process-wide lock serialises captures, because concurrent captures
+  in several threads break PyTorch's caching allocator. If a capture fails, the trees run
+  eagerly.
+* **Pipelined rounds.** Round i + 1 is enqueued before the host turns round i into dicts and
+  evaluates it. Records reach the host through pinned memory, eval uploads are asynchronous, and
+  the eval metric gets a snapshot of the training scores after round i. When early stopping ends
+  training at round i, the speculative round i + 1 is dropped. Training then rolls back to the
+  best round, so its score update does not matter.
+* **Histogram kernel** (`histogram_level`):
+  * bins are stored feature-major `[F, N]` during fit, so reads are coalesced;
+  * one block takes a tile of rows of one node and a group of up to 8 features, with all output
+    channels;
+  * the lanes of a warp share a row and take its channels: consecutive shared-memory addresses,
+    coalesced `grads[row, :]`, and each value converted once for the whole feature group;
+  * the inner loop is branch-free: inactive lanes add 0, features beyond the group add into a
+    scratch tail;
+  * on the target workload, histogram time per tree went from 37 ms to 2.5 ms. It is now limited by
+    shared-memory throughput (78 % in Nsight Compute).
+* **Integer shared-memory accumulation in both modes.** On Turing, shared-memory float
+  `atomicAdd` is about 2× slower than integer atomics; measured, it is presumably emulated with a
+  compare-and-swap loop. So both modes accumulate a tile's rows as 32-bit fixed-point integers.
+  The power-of-two scales come from `max|g|` and the tile size, computed on the device without a
+  host sync.
+* **Unit-hessian shortcut.** For squared error without missing targets and with the same weight
+  for every output, every hessian equals the row weight. The hessian sums are then read from the
+  row-weight ("count") channel: K + 1 channels instead of 2K + 1. Objectives declare this with the
+  private hint `Objective._hessian_is_one()`.
+* **Sibling subtraction** is one fused kernel (`sibling_subtract`). Only the built slots are
+  zeroed, and parents without a split are skipped.
+* **Split kernel.** One block per (feature, node) loops over the eras. It converts each histogram
+  bin to float once and builds the prefix sums in shared memory, in bin order (deterministic). It
+  then evaluates the candidates and writes the per-era gains, the era-mean gain, the directional
+  agreement and the monotone flag. `select_split` reproduces the former `find_best_split`
+  semantics: maximal agreement over all candidates of the node, then `gain > min_split_gain`,
+  then the monotone mask, then the first maximal gain.
+* **Memory guard.** A level keeps its histograms (needed for subtraction) only if
+  parent + child levels fit in 40 % of the free GPU memory at fit. Otherwise the nodes of the
+  level are processed in chunks and both children are built directly. In deterministic mode the
+  forests are identical either way (tested).
+* `gc.collect()` at the end of `fit` is gone; it cost about 55 ms per fit.
+* The `threads_per_block` and `rows_per_thread` parameters were removed: the kernels choose their
+  launch configuration. Passing them raises `TypeError`.
+
+**`deterministic` (constructor, default `True`, saved by `save_model`; older pickles load as `True`).**
+
+* `True`:
+  * histograms are int64 fixed-point sums; sibling histograms are exact (integer subtraction);
+  * node totals are fixed-point too;
+  * repeated fits, concurrent fits, CUDA-graph replay and eager runs give identical forests.
+* `False`:
+  * the tile sums are flushed into float32 histograms with float atomics, so rounding depends on
+    the order of the atomics;
+  * half the histogram memory and traffic (memset, subtraction, split kernel);
+  * same algorithm: predictions differ from deterministic mode by float rounding, and near-tie
+    splits can flip.
+* `random_state` controls the column sampling in both modes.
+* Lower-precision arithmetic (fp16 / bf16) was considered and not adopted. Sums over thousands
+  of rows need fp32, and the bottleneck is shared-memory atomics, not FLOPs or bandwidth. Turing
+  (GTX 16xx, T4) has no tensor-core path that applies here.
+
+**Prediction.**
+
+* **Packed forest.** Each round is flattened once, for all outputs, into structure-of-arrays numpy
+  data (`_pack_round`):
+  * `nodes [t, M, 4]`;
+  * leaves `[t, M, Lw]`, already multiplied by the learning rate;
+  * `out_col` for per-output trees.
+
+  It is cached with a lazily uploaded GPU copy and extended as rounds are added. Truncation keeps
+  the rounds before the cut. `num_trees=c` is a slice. Empty rounds cannot shift slices, because
+  the cache stores the tree count after each round.
+* **One kernel for all outputs** (`predict_forest`):
+  * one thread per row, register accumulators for up to 32 outputs;
+  * the trees are added in order with plain additions (no FMA with the learning rate), then the
+    base score;
+  * explicit strides, so it reads row-major and feature-major bins;
+  * checkpoints write several prefixes in one pass.
+* **`staged_predict_raw` / `staged_predict` / `staged_predict_proba(X, rounds)`** return
+  `(len(rounds), n, …)` from one pass. Each entry is bit-identical to
+  `predict_raw(X, num_trees=r)`. This replaces the hedge project's `tune.py::staged_predict`
+  workaround, which used the removed internals `_get_cached_tree_tensors` /
+  `_accumulate_tree_tensors`.
+* **Opt-in CPU path.** `device="cpu"` on `predict`, `predict_raw`, `predict_proba` and
+  `staged_*` makes no CUDA call:
+  * NumPy binning with the same rule as the CUDA binner;
+  * traversal vectorised over trees on flat per-field arrays;
+  * sequential float32 accumulation, so raw scores are bit-identical to the GPU kernel (softmax
+    probabilities may differ in the last bit).
+
+  This is the low-latency option for a few rows.
+* **Training eval.** The eval scores accumulate each new round with the prediction kernel (per-row
+  base). They equal `predict_raw(X_eval, num_trees=i + 1)` exactly, without re-flattening.
+
+**Results** (GTX 1660 Ti; ms per tree including the per-fit setup amortised over 30 trees, idle
+GPU; `python benchmarks/bench_small_wide.py --large`). Base config: 10k × 1000, K = 20, 3 eras,
+16 bins, depth 4, colsample 0.4, `min_child_weight=50`, 2 % NaN features.
+
+| variant | v2.6.0 | v2.7.0 `deterministic=True` | v2.7.0 `deterministic=False` |
+|---|---|---|---|
+| base config | 53.1 | 6.6 (8.0×) | 5.1 (10.4×) |
+| depth 7 | 124.7 | 15.3 (8.2×) | 12.9 (9.7×) |
+| 64 bins | 160.7 | 11.7 (13.7×) | 10.7 (15.0×) |
+| 8 eras | 74.2 | 9.0 (8.2×) | 8.3 (8.9×) |
+| colsample 1.0 | 111.1 | 9.6 (11.6×) | 9.0 (12.3×) |
+| K = 1 | 13.6 | 3.0 (4.5×) | 2.7 (5.0×) |
+| depth 7, 64 bins, 8 eras, colsample 1.0 | 778.3 | 171.5 (4.5×) | 121.1 (6.4×) |
+
+Without the per-fit setup (binning, upload, first eager tree and graph capture, about
+15–30 ms per fit), the base config trains at 5.1 / 4.6 ms per tree, the GPU time.
+
+Hedge-like configuration: 1681 pre-binned features, colsample 0.4, K = 20 with 5 % NaN targets
+(so no unit-hessian shortcut), 16 bins, depth 4, `min_child_weight=300`, 3 eras, 10k rows,
+100 trees.
+
+| | v2.6.0 | v2.7.0 `deterministic=True` | v2.7.0 `deterministic=False` |
+|---|---|---|---|
+| fit, ms per tree | 59.0 | 10.8 | 9.6 |
+| single-row `predict`, GPU | 2.36 ms | 0.35 ms | 0.36 ms |
+| single-row `predict(device="cpu")` | — | 0.15 ms | 0.15 ms |
+
+Prediction at 16 checkpoints of an 80-tree, K = 20 model (2000 rows) took 8.6 s in v2.6.0 (cold
+cache, mostly re-flattening). With `predict(num_trees=c)` it now takes 27 ms, and with one
+`staged_predict` call 1.9 ms.
+
+**Accuracy.** The reference cases were fitted with v2.6.0 and v2.7.0 on the same data:
+
+* regression, multi-regression K = 20 with 3 and 8 eras, multiclass, monotone constraints;
+* NaN features;
+* both v2.7.0 modes.
+
+Held-out scores are identical to 5 decimals. The largest prediction difference from v2.6.0 is
+7e-7 (mean 1e-7).
+
+**Split semantics (unchanged, documented here because they matter for tuning).**
+
+* `min_child_weight` applies to the summed row weights of a child **in every era**, not to the
+  node total.
+* The split gain is summed over the K outputs and averaged over eras. `min_split_gain` is compared
+  with that value, so its useful scale depends on K, the era sizes and the target variance.
+* With several eras, an era's direction is ±1 only if all K outputs agree (else 0). Only
+  candidates with the node's maximal directional agreement qualify. With many outputs this can be
+  restrictive.
+* `L2_reg` is the λ in G / (H + λ). With the squared-error hessian of 1 per row it matters once λ
+  approaches the number of rows per leaf.
+
 ---
 
 ## 4. Behaviour changes to be aware of
@@ -248,6 +424,11 @@ load (tested).
 | single-output regression without NaNs/weights | — | same predictions as before up to float rounding (max abs diff 6e-5 at prediction scale 540) |
 | pre-binned detection (v2.6.0) | heuristic `integer and max < num_bins` at fit **and** at every predict | explicit `prebinned=True` (-1 = missing), or auto-detection once at fit (`[0, num_bins-1]`), stored as `prebinned_`. Float input to a pre-binned model raises; integer input to a raw-feature model is binned with its edges. Pre-binned models have `bin_edges=None`. Older pickles keep binning with their stored (identity) edges |
 | `training_loss` (v2.6.0) | one value per round | one value per eval checkpoint by default; `record_training_loss="all"` restores per-round values. Older pickles load with `"all"` |
+| forests (v2.7.0) | — | close to v2.6.0, not bit-identical: fixed-point tiles of 1024–8192 rows (quantisation step max abs(g) · tile / 2^30, before 256 rows), leaf values from fixed-point node totals, split gains from float prefix sums. Held-out scores of the reference cases are identical to 5 decimals |
+| predictions (v2.7.0) | `acc += lr * leaf` in the kernel, per output | leaves pre-multiplied by the learning rate, one kernel for all outputs; differences of float rounding (≤ 1e-6 relative) |
+| `threads_per_block`, `rows_per_thread` (v2.7.0) | constructor parameters (histogram launch configuration) | removed; passing them raises `TypeError` |
+| internal API (v2.7.0) | `compute_histograms`, `find_best_split`, `grow_tree`, `_get_cached_tree_tensors`, `_accumulate_tree_tensors`, CUDA `compute_histogram3` / `compute_split` / `predict_forest` | replaced by the level-wise engine (`_grow_tree_device`) and the packed forest (`_packed_forest`); CUDA `histogram_level`, `node_sums`, `sibling_subtract`, `level_split`, `select_split`, `predict_forest` (new signature). `flatten_tree` is kept but unused |
+| end of `fit` (v2.7.0) | `gc.collect()` | removed (cost about 55 ms per fit) |
 
 ---
 
@@ -277,6 +458,20 @@ pyenv), installed with `pip install --no-build-isolation`.
 
 ---
 
+* **v2.7.0:** 166 tests pass and 2 skip (the `cuda:1` tests need a second GPU), against the in-place
+  build. 18 tests are new in `tests/test_performance_modes.py`:
+  * identical repeated fits, CUDA-graph replay = eager, chunked levels = subtraction;
+  * quality of the fast mode against the deterministic one;
+  * the unit-hessian shortcut against an autograd loss;
+  * staged and CPU predictions bit-identical to the GPU at every round count;
+  * eval scores equal to predictions;
+  * early stopping with the pipelined rounds;
+  * the `deterministic` parameter in old pickles.
+
+  The histogram-kernel test now covers both modes, two segments and the unit-hessian layout. A
+  4-thread stress test (repeated deterministic and fast fits on one GPU) matched sequential
+  forests.
+
 ## 6. Known limitations
 
 * Training and prediction require CUDA; there is no CPU code path. Since v2.5.0 the constructor
@@ -286,5 +481,11 @@ pyenv), installed with `pip install --no-build-isolation`.
   such as a Pearson correlation over all rows are not supported: they were tried and did not
   train better than MSE on suitably standardized targets, at the cost of a much more complex
   interface.
+* The level arrays are dense (2^depth nodes per level), so very deep trees (depth ≳ 12) waste memory
+  and launches on inactive nodes. The memory guard keeps them working, slowly.
+* CUDA-graph capture is serialised per process. Other code that captures CUDA graphs in a
+  parallel thread may still conflict; set `WarpGBM._use_cuda_graphs = False` to run every tree
+  eagerly.
+* At most 65535 (sampled) features per tree; the histogram grid has features on its y axis.
 * Older PyTorch versions limit `torch.nanquantile` to ~16M rows per feature column. PyTorch 2.14
   has no such limit (tested with 33M rows). Pre-binned integer input avoids the quantiles anyway.

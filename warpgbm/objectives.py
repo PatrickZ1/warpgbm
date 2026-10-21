@@ -126,6 +126,18 @@ class Objective:
     def has_loss(self) -> bool:
         return type(self).loss is not Objective.loss
 
+    def _hessian_is_one(self) -> bool:
+        """
+        True if :meth:`grad_hess` always returns a hessian of 1 (before weighting). The engine then
+        reads the hessian sums from the row-weight histogram instead of accumulating them
+        (a performance hint; False is always safe).
+        """
+        return (
+            type(self).grad_hess is Objective.grad_hess
+            and self.hessian == "ones"
+            and self.min_hessian <= 1.0
+        )
+
     def __repr__(self):
         return f"{type(self).__name__}()"
 
@@ -198,6 +210,9 @@ class CustomObjective(Objective):
     def transform(self, raw):
         return raw if self.transform_fn is None else self.transform_fn(raw)
 
+    def _hessian_is_one(self):
+        return self.grad_hess_fn is None and self.hessian == "ones" and self.min_hessian <= 1.0
+
     def __repr__(self):
         return f"CustomObjective(name={self.name!r})"
 
@@ -248,9 +263,18 @@ def autograd_grad_hess(
 
 
 def compute_grad_hess(
-    objective: Objective, y: Tensor, pred: Tensor, weight: Tensor, mask: Tensor
+    objective: Objective,
+    y: Tensor,
+    pred: Tensor,
+    weight: Tensor,
+    mask: Tensor,
+    check_finite: bool = True,
 ) -> Tuple[Tensor, Tensor]:
-    """Call ``objective.grad_hess``, apply weights and the target mask. Returns contiguous [N, K]."""
+    """
+    Call ``objective.grad_hess``, apply weights and the target mask. Returns contiguous [N, K].
+
+    check_finite=False skips the finiteness check (a host sync); the caller must check instead.
+    """
     g, h = objective.grad_hess(y, pred)
     shape = pred.shape
     g = torch.as_tensor(g, device=pred.device, dtype=torch.float32)
@@ -269,7 +293,7 @@ def compute_grad_hess(
     g = torch.where(mask, g * weight, zero).contiguous()
     h = torch.where(mask, h * weight, zero).contiguous()
 
-    if not bool(torch.isfinite(g).all() & torch.isfinite(h).all()):
+    if check_finite and not bool(torch.isfinite(g).all() & torch.isfinite(h).all()):
         raise FloatingPointError(
             f"Objective {objective!r} produced non-finite gradients or hessians."
         )
@@ -318,6 +342,9 @@ class SquaredError(Objective):
 
     def grad_hess(self, y, pred):
         return pred - y, torch.ones_like(pred)
+
+    def _hessian_is_one(self):
+        return type(self).grad_hess is SquaredError.grad_hess
 
     def loss(self, y, pred):
         return (pred - y) ** 2

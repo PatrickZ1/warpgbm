@@ -163,11 +163,7 @@ def _bin_range_error(X, num_bins, name):
     )
 
 
-def _prebinned_to_gpu(X, num_bins, device, name="X"):
-    """
-    Validate pre-binned input (integers in [MISSING_BIN, num_bins - 1]) and upload it as the
-    internal int8 bins [N, F]: MISSING_BIN becomes the NaN bin num_bins.
-    """
+def _check_prebinned_array(X, name):
     if not isinstance(X, np.ndarray) or not np.issubdtype(X.dtype, np.integer):
         dtype = X.dtype if isinstance(X, np.ndarray) else type(X).__name__
         raise TypeError(
@@ -177,6 +173,14 @@ def _prebinned_to_gpu(X, num_bins, device, name="X"):
         )
     if X.ndim != 2:
         raise ValueError(f"{name} must be 2-dimensional, got shape {X.shape}")
+
+
+def _prebinned_to_gpu(X, num_bins, device, name="X"):
+    """
+    Validate pre-binned input (integers in [MISSING_BIN, num_bins - 1]) and upload it as the
+    internal int8 bins [N, F]: MISSING_BIN becomes the NaN bin num_bins.
+    """
+    _check_prebinned_array(X, name)
     if X.size == 0:
         return torch.empty(X.shape, dtype=torch.int8, device=device)
 
@@ -191,3 +195,27 @@ def _prebinned_to_gpu(X, num_bins, device, name="X"):
         if lo < MISSING_BIN or hi >= num_bins:
             raise _bin_range_error(X, num_bins, name)
     return bins.masked_fill_(bins == MISSING_BIN, num_bins).contiguous()
+
+
+def _prebinned_to_cpu(X, num_bins, name="X"):
+    """CPU counterpart of _prebinned_to_gpu: validated internal int8 bins [N, F] as numpy."""
+    _check_prebinned_array(X, name)
+    if X.size and (X.min() < MISSING_BIN or X.max() >= num_bins):
+        raise _bin_range_error(X, num_bins, name)
+    bins = np.array(X, dtype=np.int8)
+    bins[bins == MISSING_BIN] = num_bins
+    return bins
+
+
+def _bin_matrix_cpu(X, edges, nan_bin):
+    """
+    CPU counterpart of _bin_matrix for small inputs: int8 bins [N, F] of X [N, F] with edges
+    [F, E] (numpy float32). Same rule as the CUDA binner: number of edges <= x, NaN -> nan_bin.
+    """
+    X = np.asarray(X, dtype=np.float32)
+    if X.ndim != 2:
+        raise ValueError(f"X must be 2-dimensional, got shape {X.shape}.")
+    with np.errstate(invalid="ignore"):
+        bins = (X[:, :, None] >= edges[None, :, :]).sum(axis=2, dtype=np.int8)
+    bins[np.isnan(X)] = nan_bin
+    return bins

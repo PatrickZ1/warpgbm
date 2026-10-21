@@ -61,10 +61,12 @@ WarpGBM.fit()
 │ 2. Forest Growing Loop              │
 │    For each boosting round:         │
 │    ├─ Compute gradients/hessians    │
-│    ├─ Build histograms (CUDA)       │
-│    ├─ Find best splits (CUDA)       │
-│    ├─ Grow tree recursively         │
-│    └─ Update predictions            │
+│    ├─ Grow the tree level by level  │
+│    │  on the GPU (CUDA graph replay)│
+│    │  histograms → splits → rows    │
+│    ├─ Update training scores        │
+│    └─ (host) tree dict + eval of    │
+│       the previous round (pipeline) │
 └─────────────────────────────────────┘
     ↓
 ┌─────────────────────────────────────┐
@@ -87,8 +89,8 @@ WarpGBM.fit()
 
 **CUDA Layer** (`warpgbm/cuda/`):
 - `binner.cu`: Feature quantization
-- `histogram_kernel.cu`: Gradient/hessian accumulation
-- `best_split_kernel.cu`: Split evaluation
+- `histogram_kernel.cu`: Gradient/hessian accumulation per tree level, node totals, sibling subtraction
+- `best_split_kernel.cu`: Split evaluation of all nodes of a level, best split per node
 - `predict.cu`: Tree traversal for inference
 - `node_kernel.cpp`: Python bindings
 
@@ -104,12 +106,14 @@ warpgbm/
 ├── __init__.py              # Package exports (WarpGBM, Objective, CustomObjective, fit_bins, apply_bins)
 ├── core.py                  # Main WarpGBM class: ONE training engine for all objectives
 │   ├── fit()                # validation → targets/weights/masks → grow_forest()
-│   ├── grow_forest()        # boosting loop: objective.grad_hess → one vector tree or K per-output trees
-│   ├── _grow_single_tree()  # per-tree setup (fixed-point scales, monotone flag), leaf values fetched once
-│   ├── grow_tree()          # recursive splits, NaN routing, monotone bound propagation
-│   ├── find_best_split()    # split kernel + era (DES) agreement + monotone mask
+│   ├── grow_forest()        # pipelined boosting loop: objective.grad_hess → one vector tree or K per-output trees
+│   ├── _run_tree()          # CUDA graph capture / replay of _grow_tree_device
+│   ├── _grow_tree_device()  # level-wise growth on the GPU: node sums, histograms, splits, row partition
+│   ├── _level_splits()      # histograms of a level (subtraction or memory-bounded chunks) + split kernels
+│   ├── _tree_from_records() # host: tree dict + feature importance from the per-tree record tensor
 │   ├── compute_eval()       # incremental eval scores, built-in / callable metrics, early stopping
-│   ├── predict(), predict_raw(), predict_proba()
+│   ├── _packed_forest()     # flattened forest cache (per round, all outputs) for the predict kernel
+│   ├── predict(), predict_raw(), predict_proba(), staged_predict*()  # device=None (GPU) or "cpu"
 │   └── save_model() / load_model()
 │
 ├── objectives.py            # Objective interface + built-ins
@@ -233,22 +237,39 @@ For each feature bin, accumulate:
 - Hessian sum per output: `H = Σ hessian_i`
 - Count channel: `C = Σ row_weight_i` (used for `min_child_weight`)
 
-**Shapes**: `G, H: (num_eras, num_features, num_bins + 1, K)`, `C: (num_eras, num_features, num_bins + 1)`
+**Shapes**: one tensor per tree level, `(nodes, num_features, num_eras, num_bins + 1, C)` with the
+channels `C = K + Kh + 1` = `[grad | hess | count]`. `Kh = 0` when every hessian equals the row
+weight (squared error without missing targets, `Objective._hessian_is_one()`); the hessian sums are
+then the count channel.
 
-**CUDA Kernel**: `histogram_kernel.cu` parallelizes over (feature, row tile, output). Values are
-accumulated as fixed-point integers (deterministic); a global-memory fallback is used when the
-per-block histogram does not fit into shared memory (many eras).
+**CUDA Kernel**: `histogram_level` parallelizes over (row tile of a node, group of up to 8
+features, channel chunk), reading feature-major bins `[F, N]` (`self.bins_fm` during fit). Blocks
+accumulate 32-bit fixed-point integers in shared memory (integer shared atomics are much faster than
+float ones on Turing) and flush into int64 (`deterministic=True`, exact) or float32
+(`deterministic=False`) histograms. A global-memory fallback is used when one channel of
+`[eras, bins]` does not fit into shared memory (many eras).
 
 **Split candidates**: `2 * num_bins` per feature — every threshold with NaN going right
 (`c < num_bins`) and with NaN going left (`c >= num_bins`).
 
-**Subtraction Trick**: For left/right child, compute smaller histogram and subtract from parent.
+**Subtraction Trick**: per level, the smaller child of every split is built and its sibling is
+`parent - child` (`sibling_subtract`; exact in int64). When parent + child levels exceed the memory
+budget (`_HIST_MEMORY_FRACTION` of free memory at fit), the level is processed in node chunks and
+both children are built directly.
+
+**Level-wise growth** (`_grow_tree_device`): nodes are numbered densely per level (children of `j`
+are `2j`, `2j+1`); nodes below a leaf are inactive. Per level: `node_sums` → values / monotone
+bounds, histograms, `level_split` + `select_split` → best split per node, rows move to their child.
+No host sync inside a tree, so `_run_tree` captures the second tree as a CUDA graph and replays it
+(static input buffers: gradients, hessians, sampled features). The tree comes back as one record
+tensor (`_tree_from_records`), and `grow_forest` pipelines rounds: round i + 1 is enqueued before
+round i is turned into dicts and evaluated.
 
 ### 6. Multiclass Implementation
 
 `Softmax.output_strategy == "per_output"`: per round the engine computes `g, h` for all classes
 once and grows one tree per class on the column `(-g[:, k], h[:, k])`, updating only score column k.
-The same code path (`_grow_single_tree(..., score_col=k)`) serves any custom per-output objective.
+The same code path (`_launch_tree(..., score_col=k)`) serves any custom per-output objective.
 
 ### 7. Feature Importance
 
@@ -258,16 +279,16 @@ The same code path (`_grow_single_tree(..., score_col=k)`) serves any custom per
 - `feature_importance_`: Array of shape `(n_features,)` with total gain per feature
 - `per_era_feature_importance_`: Array of shape `(n_eras, n_features)` with per-era gains
 
-**Accumulation Logic** (in `grow_tree()`):
+**Accumulation Logic** (in `_tree_from_records()`): the per-era gains of every accepted split come
+back with the tree's records and are added on the host, in pre-order (deterministic):
 ```python
-# When a split is accepted (accumulated on the GPU, copied once per fit):
-self._feature_importance_gpu[:, global_feature_idx] += self.per_era_gain[:, local_feature, best_candidate]
+importance[:, feature] += per_era_gains.astype(np.float32)   # self._feature_importance_acc [E, F]
 ```
 
 **Aggregation** (after training, in grow_forest()):
 ```python
-self.per_era_feature_importance_ += self._feature_importance_gpu.cpu().numpy()
-self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
+self._per_era_importance_all = base + self._feature_importance_acc
+self.feature_importance_ = self._total_importance(n)   # from the per-split "gain" of the used rounds
 ```
 
 **Multiclass**: Importance is accumulated across all K trees per iteration. This means a feature used in multiple class trees gets higher importance (which is correct behavior).
@@ -520,7 +541,7 @@ maximized). `_metric_value()` returns natural values.
 Example: L1 regularization (already in constructor, needs implementation):
 
 ```python
-# In grow_tree(), update leaf value computation:
+# In _grow_tree_device(), update the node value computation (val = G / (H + L2_reg)):
 def compute_leaf_value(self, grad_sum, hess_sum):
     # Current: -G / (H + λ_L2)
     # With L1: soft thresholding
@@ -616,33 +637,40 @@ X, y = make_blobs(n_samples=1000, centers=5, random_state=42)
 - Used: Once at fit time, once at predict time
 
 **2. Histogram** (`histogram_kernel.cu`):
-- Input: Binned data, gradients/hessians `[N, K]`, row weights, sample indices, era indices, fixed-point scales
-- Output: Gradient/hessian sums per (era, feature, bin, output) + row-weight count per (era, feature, bin)
-- Parallelization: Block per (feature, row tile, output); 32-bit fixed-point shared-memory accumulators flushed into 64-bit global accumulators → deterministic
-- Fallback: global-memory kernel when `3 * eras * bins * 4` bytes exceed shared memory
-- Used: Once per tree node (most expensive operation)
+- `histogram_level`: histograms `[slots, F, E, B, C]` of the nodes of a level from row segments
+  (`order`, `seg_start`, `seg_len`, `seg_slot`, `tile_offset`); block per (row tile, feature group,
+  channel chunk); lanes of a warp share a row and take its channels; branch-free inner loop
+- `node_sums`: `[nodes, C]` totals per node (leaf values, monotone bounds)
+- `sibling_subtract`: `hist[sibling] = parent - hist[built]` for split parents
+- Fixed-point scales are computed on the device (`_device_scale`), per tree, for tiles of
+  `_tile_rows` rows (1024–8192, from eras × bins)
+- Used: a few times per tree level (most expensive operation)
 
 **3. Split Finding** (`best_split_kernel.cu`):
-- Input: Histograms
-- Output: Per-era gains and split directions for `2 * num_bins` candidates (both NaN directions)
+- `level_split`: block per (feature, node), thread per candidate (`2 * num_bins`, both NaN
+  directions); loops over eras with float prefix sums in shared memory; writes per-era gain, era-mean
+  gain, directional agreement, monotone flag
+- `select_split`: block per node; max agreement over all candidates, then `gain > min_split_gain`,
+  monotone mask, first maximal gain → `best[node]` (−1 = leaf), per-era gains of the best
 - Gain summed over outputs; direction only if all outputs agree; `min_child_weight` on the count channel, `min_sum_hessian` per output
-- Parallelization: Block per (feature, era), thread per candidate
-- Used: Once per tree node; the DES agreement / monotone masks are applied in `find_best_split()`
 
 **4. Prediction** (`predict.cu`):
-- Input: Binned data, flattened tree structures `[T, max_nodes, 7]` (col 6 = NaN direction)
-- Output: Predictions (one call per score column)
-- Parallelization: One thread per (sample, tree) pair
-- Used: At inference time and for incremental eval scores during training
+- Input: bins with explicit strides (row- or feature-major), packed forest `nodes [T, M, 4]`
+  (feature or −1, split bin | nan_left << 8, left, right), `leaf [T, M, Lw]` (× learning rate),
+  `out_col` for per-output trees, base score `[K]` or `[N, K]`, checkpoint tree counts
+- Output: `[checkpoints, N, K]`; one thread per row, all trees and outputs, in-order plain additions
+  (deterministic, bit-identical to the NumPy path `_predict_raw_staged_cpu`)
+- The packed forest is built once per round (`_pack_round`) and cached (`_packed_forest`)
 
 ### Memory Management
 
 **GPU Tensors** (stay on GPU throughout training):
-- `self.bin_indices`: Binned feature data
+- `self.bins_fm`: Binned feature data, feature-major `[F, N]` int8
 - `self.scores`: Current raw scores `[N, K]` (all objectives)
 - `self.Y_gpu`: Target labels
 - `self.era_indices`: Era assignments
-- Histograms (transient, recomputed per node)
+- Histograms (transient, per tree level; the previous level is kept for subtraction)
+- CUDA graph of the tree (`_tree_graphs`, released at the end of `fit`)
 
 **CPU → GPU Transfer**:
 - Only during `fit()` initialization
@@ -654,15 +682,11 @@ X, y = make_blobs(n_samples=1000, centers=5, random_state=42)
 
 ### CUDA Tuning
 
-**Key Parameters**:
-- `threads_per_block`: 32-64 for most GPUs (multiple of warp size)
-- `rows_per_thread`: 4-8 for most datasets
-- Bigger values → less thread divergence, more registers
-
-**Guidelines**:
-- For small datasets (< 10K rows): Use smaller `rows_per_thread`
-- For large datasets (> 1M rows): Increase `threads_per_block` to 128
-- For many features (> 1K): Histogram kernel benefits from more parallelism
+Since v2.7.0 the kernels choose their launch configuration (the `threads_per_block` and
+`rows_per_thread` parameters were removed). Measure with
+`benchmarks/bench_small_wide.py` (`--profile` for a kernel breakdown; `WarpGBM._use_cuda_graphs =
+False` makes individual kernels visible to the profiler). The histogram kernel is bound by
+shared-memory atomics; blocks use at most 32 KB of shared memory so that several fit on an SM.
 
 ---
 

@@ -30,8 +30,6 @@ def test_numerai_data():
         num_bins=5,
         n_estimators=100,
         learning_rate=1,
-        threads_per_block=64,
-        rows_per_thread=4,
         colsample_bytree=0.8,
     )
 

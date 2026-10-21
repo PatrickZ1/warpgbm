@@ -1,5 +1,6 @@
 import inspect
 import math
+import threading
 import warnings
 from dataclasses import dataclass
 import torch
@@ -28,13 +29,14 @@ from warpgbm.binning import (
     MAX_NUM_BINS,
     MIN_NUM_BINS,
     _bin_matrix,
+    _bin_matrix_cpu,
     _check_device,
+    _prebinned_to_cpu,
     _prebinned_to_gpu,
     _quantile_edges,
     _to_float_gpu,
 )
 from warpgbm.cuda import _get_node_kernel
-import gc
 
 
 @dataclass
@@ -51,8 +53,17 @@ class _TargetWeights:
         return self.weight.mean(dim=1)
 
 
-# Width of a flattened tree node, see warpgbm/cuda/predict.cu
+# Width of a flattened tree node of flatten_tree (legacy layout of the v2.6 predict kernel)
 _NODE_WIDTH = 7
+
+# One CUDA graph capture at a time in this process: concurrent captures in several threads (fits
+# running in parallel) break PyTorch's caching allocator (see WarpGBM._run_tree)
+_GRAPH_CAPTURE_LOCK = threading.Lock()
+_CAPTURE_MODE = "thread_local"
+
+# Fraction of the free GPU memory (at fit) that the histograms of one tree level may use;
+# above it a level is processed in node chunks without histogram subtraction
+_HIST_MEMORY_FRACTION = 0.4
 
 _REGRESSION_METRICS = ["mse", "corr", "rmsle", "loss"]
 _MULTI_OUTPUT_METRICS = ["mse", "loss"]
@@ -68,6 +79,19 @@ class WarpGBM(BaseEstimator, RegressorMixin):
     prebinned = None
     prebinned_ = False
     record_training_loss = "all"
+    deterministic = True
+    # Prediction caches (see _invalidate_prediction_cache)
+    _pack_rounds = None
+    _pack_concat = None
+    _pack_device = None
+    _pack_key = None
+    _edges_cpu = None
+    _base_cpu = None
+    _base_gpu = None
+    _flat_cpu = None
+    _tree_graphs = {}
+    # Replay trees as CUDA graphs (see _run_tree); False runs every tree eagerly
+    _use_cuda_graphs = True
 
     def __init__(
         self,
@@ -78,8 +102,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         n_estimators=100,
         min_child_weight=20,
         min_split_gain=0.0,
-        threads_per_block=64,
-        rows_per_thread=4,
         L2_reg=1e-6,
         device="cuda",
         colsample_bytree=1.0,
@@ -90,6 +112,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         verbose=True,
         prebinned=None,
         record_training_loss="eval",
+        deterministic=True,
     ):
         # Validate arguments
         self._validate_hyperparams(
@@ -100,8 +123,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             n_estimators=n_estimators,
             min_child_weight=min_child_weight,
             min_split_gain=min_split_gain,
-            threads_per_block=threads_per_block,
-            rows_per_thread=rows_per_thread,
             L2_reg=L2_reg,
             device=device,
             colsample_bytree=colsample_bytree,
@@ -109,6 +130,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             min_sum_hessian=min_sum_hessian,
             prebinned=prebinned,
             record_training_loss=record_training_loss,
+            deterministic=deterministic,
         )
 
         self.objective = objective
@@ -134,8 +156,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.min_child_weight = min_child_weight
         self.min_split_gain = min_split_gain
         self.min_sum_hessian = min_sum_hessian
-        self.threads_per_block = threads_per_block
-        self.rows_per_thread = rows_per_thread
         self.L2_reg = L2_reg
         self.forest = [{} for _ in range(self.n_estimators)]
         self.colsample_bytree = colsample_bytree
@@ -145,6 +165,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.verbose = verbose
         self.prebinned = prebinned
         self.record_training_loss = record_training_loss
+        self.deterministic = deterministic
         self.prebinned_ = False
         self._rng = None
         self.label_encoder = None
@@ -157,8 +178,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._targets_1d = True
         self._is_fitted = False
         self._trees_trained = 0  # Track number of trees already trained
-        self._cached_tree_tensors = None
-        self._cached_tree_key = None
+        self._invalidate_prediction_cache()
         self._objective_source = None
         self._reset_eval_state()
         self._per_era_importance_all = None
@@ -193,8 +213,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             "num_bins",
             "max_depth",
             "n_estimators",
-            "threads_per_block",
-            "rows_per_thread",
         ]
         float_params = [
             "learning_rate",
@@ -233,14 +251,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             raise ValueError("min_split_gain must be non-negative.")
         if kwargs["min_sum_hessian"] < 0:
             raise ValueError("min_sum_hessian must be non-negative.")
-        if kwargs["threads_per_block"] <= 0 or kwargs["threads_per_block"] % 32 != 0:
-            raise ValueError(
-                "threads_per_block should be a positive multiple of 32 (warp size)."
-            )
-        if not (1 <= kwargs["rows_per_thread"] <= 16):
-            raise ValueError(
-                "rows_per_thread must be positive between 1 and 16 inclusive."
-            )
         if kwargs["L2_reg"] < 0:
             raise ValueError("L2_reg must be non-negative.")
         if kwargs["colsample_bytree"] <= 0 or kwargs["colsample_bytree"] > 1:
@@ -250,6 +260,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         if kwargs["prebinned"] not in (None, True, False):
             raise TypeError(f"prebinned must be None, True or False, got {kwargs['prebinned']!r}.")
+        if not isinstance(kwargs["deterministic"], (bool, np.bool_)):
+            raise TypeError(f"deterministic must be True or False, got {kwargs['deterministic']!r}.")
         if kwargs["record_training_loss"] not in _RECORD_TRAINING_LOSS:
             raise ValueError(
                 f"record_training_loss must be one of {_RECORD_TRAINING_LOSS}, "
@@ -387,19 +399,21 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         return self.objective_.output_strategy
 
     def _base_score_tensor(self):
-        """Initial raw score as a [K] tensor on the model device."""
-        K = self.num_outputs
-        base = self.base_prediction
-        if base is None:
-            # Models saved before the base score of classifiers was stored started at 0
-            return torch.zeros(K, dtype=torch.float32, device=self.device)
-        base = torch.as_tensor(base, dtype=torch.float32).to(self.device).reshape(-1)
-        if base.numel() == 1 and K > 1:
-            base = base.expand(K).clone()
-        return base
+        """Initial raw score as a [K] tensor on the model device (cached, see _base_score_np)."""
+        if self._base_gpu is None or self._base_gpu.device != torch.device(self.device):
+            self._base_gpu = self._to_device(self._base_score_np())
+        return self._base_gpu
+
+    def _to_device(self, array):
+        """numpy array -> tensor on the model device, copied asynchronously from pinned memory."""
+        return torch.from_numpy(np.ascontiguousarray(array)).pin_memory().to(
+            self.device, non_blocking=True
+        )
 
     def _store_base_score(self, base):
         """Keep the legacy representation: a float for single-output regression."""
+        self._base_cpu = None
+        self._base_gpu = None
         base = base.detach().to(torch.float32).reshape(-1)
         if base.numel() == 1 and not self.objective_.is_classifier:
             self.base_prediction = float(base.item())
@@ -677,87 +691,242 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         )
         return Y_gpu, tw
 
-    # ─── Prediction cache ───
+    # ─── Packed forest (prediction) ───
+    #
+    # Every boosting round is flattened once into numpy arrays (see warpgbm/cuda/predict.cu):
+    #   nodes [t, M, 4] int32: feature (-1 = leaf), split_bin | nan_left << 8, left, right
+    #   leaf  [t, M, Lw] float32: leaf values times the learning rate (Lw = K for vector trees)
+    #   out_col [t] int32: score column of each tree (per-output forests only)
+    # where t is the number of trees of the round. Rounds are packed lazily and kept until the
+    # forest changes (fresh fit, truncate, load); the first n rounds are a prefix of the
+    # concatenation, so any num_trees is a slice and never re-flattens.
 
-    def _invalidate_prediction_cache(self):
-        self._cached_tree_tensors = None
-        self._cached_tree_key = None
+    def _invalidate_prediction_cache(self, keep_rounds=0):
+        """Drop packed rounds from keep_rounds on, and all concatenations."""
+        packs = self._pack_rounds
+        self._pack_rounds = [] if not packs else packs[:keep_rounds]
+        self._pack_concat = None
+        self._pack_device = None
+        self._flat_cpu = None
+        if keep_rounds == 0:
+            self._pack_key = None
+            self._edges_cpu = None
+            self._base_cpu = None
+            self._base_gpu = None
 
-    def _flatten_for_output(self, tree, max_nodes, output_index):
-        # Single-output trees are flattened without output_index (keeps flatten_tree overridable)
-        if output_index is None:
-            return self.flatten_tree(tree, max_nodes=max_nodes)
-        return self.flatten_tree(tree, max_nodes=max_nodes, output_index=output_index)
+    def _pack_layout(self):
+        """(max nodes per tree, leaf width, per-output) of the packed forest."""
+        per_output = self._output_strategy() == PER_OUTPUT
+        leaf_width = 1 if per_output else self.num_outputs
+        return 2 ** (self.max_depth + 1), leaf_width, per_output
 
-    def _trees_per_output(self, rounds):
-        """Group fitted trees by score column: returns K lists of (tree, output_index)."""
-        K = self.num_outputs
-        groups = [[] for _ in range(K)]
-        if self._output_strategy() == PER_OUTPUT:
-            for round_trees in rounds:
-                if not round_trees:
-                    continue
-                for k, tree in enumerate(round_trees):
-                    if tree:
-                        groups[k].append((tree, None))
-        else:
-            for tree in rounds:
-                if not tree:
-                    continue
-                for k in range(K):
-                    groups[k].append((tree, None if K == 1 else k))
-        return groups
-
-    def _flatten_groups(self, groups):
-        max_nodes = 2 ** (self.max_depth + 1)
-        tensors = []
-        for group in groups:
-            if group:
-                tensors.append(
-                    torch.stack(
-                        [
-                            self._flatten_for_output(tree, max_nodes, out_idx)
-                            for tree, out_idx in group
-                        ]
-                    ).to(self.device)
-                )
+    def _pack_tree(self, tree, max_nodes, leaf_width):
+        """Flatten one tree dict (pre-order node ids) into (nodes [M, 4], leaf [M, Lw])."""
+        nodes = np.zeros((max_nodes, 4), dtype=np.int32)
+        nodes[:, 0] = -1
+        leaf = np.zeros((max_nodes, leaf_width), dtype=np.float32)
+        counter = 0
+        stack = [(tree, None, 0)]  # (node, parent id, 2 = left / 3 = right)
+        while stack:
+            node, parent, side = stack.pop()
+            i = counter
+            counter += 1
+            if parent is not None:
+                nodes[parent, side] = i
+            if "leaf_value" in node:
+                value = node["leaf_value"]
+                if isinstance(value, torch.Tensor):
+                    value = value.detach().cpu().tolist()
+                if isinstance(value, (list, tuple, np.ndarray)):
+                    leaf[i] = np.asarray(value, dtype=np.float32)[:leaf_width]
+                else:
+                    leaf[i] = value
             else:
-                tensors.append(None)
-        return tensors
+                nodes[i, 0] = int(node["feature"])
+                nodes[i, 1] = int(node["bin"]) | (int(bool(node.get("nan_left", False))) << 8)
+                # Right is pushed first so that the left subtree gets the next ids
+                stack.append((node["right"], i, 3))
+                stack.append((node["left"], i, 2))
+        leaf *= np.float32(self.learning_rate)
+        return nodes, leaf
 
-    def _get_cached_tree_tensors(self, num_trees):
-        max_nodes = 2 ** (self.max_depth + 1)
-        key = (
-            str(self.device),
-            max_nodes,
-            self._output_strategy(),
-            num_trees,
-            self.num_outputs,
-        )
-        if self._cached_tree_tensors is not None and self._cached_tree_key == key:
-            return self._cached_tree_tensors
+    def _pack_round(self, round_trees):
+        max_nodes, leaf_width, per_output = self._pack_layout()
+        trees = round_trees if per_output else [round_trees]
+        packed = [
+            (self._pack_tree(tree, max_nodes, leaf_width), k)
+            for k, tree in enumerate(trees)
+            if tree
+        ]
+        nodes = np.zeros((len(packed), max_nodes, 4), dtype=np.int32)
+        leaf = np.zeros((len(packed), max_nodes, leaf_width), dtype=np.float32)
+        out_col = np.zeros(len(packed), dtype=np.int32)
+        for j, ((n, l), k) in enumerate(packed):
+            nodes[j], leaf[j], out_col[j] = n, l, k
+        return nodes, leaf, out_col
 
-        rounds = self.forest[:num_trees]
-        tensors = self._flatten_groups(self._trees_per_output(rounds))
-        self._cached_tree_tensors = tensors
-        self._cached_tree_key = key
-        return tensors
+    def _ensure_packed(self, num_rounds):
+        key = (float(self.learning_rate), self.max_depth, self.num_outputs, self._output_strategy())
+        if self._pack_key != key:
+            self._invalidate_prediction_cache()
+            self._pack_key = key
+        for r in range(len(self._pack_rounds), num_rounds):
+            self._pack_rounds.append(self._pack_round(self.forest[r]))
 
-    def _accumulate_tree_tensors(self, bin_indices, tree_tensors, out):
-        """Add learning_rate * sum of trees to out[:, k] for every score column k."""
-        bin_indices = bin_indices.contiguous()
-        for k, tree_tensor in enumerate(tree_tensors):
-            if tree_tensor is None or tree_tensor.size(0) == 0:
-                continue
-            col = torch.zeros(out.shape[0], device=self.device, dtype=torch.float32)
-            _get_node_kernel().predict_forest(
-                bin_indices,
-                tree_tensor.contiguous(),
-                self.nan_bin,
-                self.learning_rate,
-                col,
+    def _packed_forest(self, num_rounds, device=None):
+        """
+        Packed first num_rounds rounds: (nodes, leaf, out_col or None, round_end) as numpy
+        arrays (device=None) or tensors on device. round_end[r] = trees in rounds 0..r.
+        """
+        self._ensure_packed(num_rounds)
+        if self._pack_concat is None or self._pack_concat[0] < num_rounds:
+            packs = self._pack_rounds
+            max_nodes, leaf_width, per_output = self._pack_layout()
+            if packs:
+                nodes = np.concatenate([p[0] for p in packs])
+                leaf = np.concatenate([p[1] for p in packs])
+                out_col = np.concatenate([p[2] for p in packs])
+            else:
+                nodes = np.zeros((0, max_nodes, 4), dtype=np.int32)
+                leaf = np.zeros((0, max_nodes, leaf_width), dtype=np.float32)
+                out_col = np.zeros(0, dtype=np.int32)
+            round_end = np.cumsum([len(p[0]) for p in packs], dtype=np.int64)
+            self._pack_concat = (len(packs), nodes, leaf, out_col if per_output else None, round_end)
+            self._pack_device = None
+        _, nodes, leaf, out_col, round_end = self._pack_concat
+        n_trees = int(round_end[num_rounds - 1]) if num_rounds > 0 else 0
+        if device is None:
+            return (
+                nodes[:n_trees],
+                leaf[:n_trees],
+                None if out_col is None else out_col[:n_trees],
+                round_end[:num_rounds],
             )
-            out[:, k] += col
+        if self._pack_device is None or self._pack_device[0] != (self._pack_concat[0], str(device)):
+            self._pack_device = (
+                (self._pack_concat[0], str(device)),
+                self._to_device(nodes),
+                self._to_device(leaf),
+                None if out_col is None else self._to_device(out_col),
+            )
+        _, nodes_t, leaf_t, out_col_t = self._pack_device
+        return (
+            nodes_t[:n_trees],
+            leaf_t[:n_trees],
+            None if out_col_t is None else out_col_t[:n_trees],
+            round_end[:num_rounds],
+        )
+
+    def _forest_kernel(self, bins, nodes, leaf, out_col, base, tree_counts, feature_major=False):
+        """
+        Raw scores [P, N, K] = base + sum of the first tree_counts[p] packed trees, on the GPU.
+        bins is row-major [N, F] or feature-major [F, N] (feature_major=True).
+        """
+        if feature_major:
+            num_rows = bins.size(1)
+            row_stride, feat_stride = 1, bins.size(1)
+        else:
+            num_rows = bins.size(0)
+            row_stride, feat_stride = bins.size(1), 1
+        ckpt = self._to_device(np.asarray(tree_counts, dtype=np.int64))
+        out = torch.empty(
+            (len(tree_counts), num_rows, self.num_outputs), device=self.device, dtype=torch.float32
+        )
+        _get_node_kernel().predict_forest(
+            bins.contiguous(),
+            row_stride,
+            feat_stride,
+            num_rows,
+            nodes,
+            leaf,
+            out_col,
+            base.contiguous(),
+            self.nan_bin,
+            ckpt,
+            out,
+        )
+        return out
+
+    def _predict_raw_staged_binned(self, bin_indices, rounds, feature_major=False, base=None):
+        """
+        Raw scores [P, N, K] after rounds[p] boosting rounds (rounds ascending), on the GPU.
+        base: [K] score the trees are added to (default: the model's base score).
+        """
+        nodes, leaf, out_col, round_end = self._packed_forest(max(rounds), self.device)
+        tree_counts = [int(round_end[r - 1]) if r > 0 else 0 for r in rounds]
+        if base is None:
+            base = self._base_score_tensor()
+        return self._forest_kernel(
+            bin_indices, nodes, leaf, out_col, base, tree_counts, feature_major
+        )
+
+    def _flat_forest_cpu(self, num_rounds):
+        """
+        Packed forest as flat per-field arrays over global node ids t * M + j, with the children
+        as global ids (cached with the packed forest): (feature, split_bin, nan_left, left, right,
+        leaf [T * M, Lw], out_col, round_end).
+        """
+        _, _, out_col, round_end = self._packed_forest(num_rounds)
+        # Flatten the whole concatenation once; a prefix of rounds only visits its own trees
+        key, nodes, leaf = self._pack_concat[:3]
+        flat = self._flat_cpu
+        if flat is None or flat[0] != key:
+            T, M = nodes.shape[:2]
+            offset = (np.arange(T, dtype=np.int64) * M)[:, None]
+            flat = (
+                key,
+                nodes[..., 0].reshape(-1),
+                (nodes[..., 1] & 0xFF).reshape(-1),
+                ((nodes[..., 1] >> 8) & 1).astype(bool).reshape(-1),
+                (nodes[..., 2] + offset).reshape(-1),
+                (nodes[..., 3] + offset).reshape(-1),
+                leaf.reshape(T * M, leaf.shape[2]),
+            )
+            self._flat_cpu = flat
+        return flat[1:] + (out_col, round_end)
+
+    def _predict_raw_staged_cpu(self, bins, rounds):
+        """CPU version of _predict_raw_staged_binned for internal bins [N, F] (numpy int8)."""
+        feature, split_bin, nan_left, left, right, leaf, out_col, round_end = self._flat_forest_cpu(
+            max(rounds)
+        )
+        tree_counts = [int(round_end[r - 1]) if r > 0 else 0 for r in rounds]
+        base = self._base_score_np()
+        K = self.num_outputs
+        n, T = bins.shape[0], max(tree_counts)
+        out = np.empty((len(rounds), n, K), dtype=np.float32)
+        if T == 0 or n == 0:
+            out[:] = base
+            return out
+        M = 2 ** (self.max_depth + 1)
+        roots = np.arange(T, dtype=np.int64) * M
+        F = bins.shape[1]
+        # Bound the [rows, T, K] intermediate arrays
+        chunk = max(1, (1 << 22) // (T * max(K, 4)))
+        for start in range(0, n, chunk):
+            b = bins[start : start + chunk]
+            rows = b.shape[0]
+            flat_bins = b.reshape(-1).astype(np.int64)
+            row_offset = (np.arange(rows, dtype=np.int64) * F)[:, None]
+            node = np.broadcast_to(roots, (rows, T)).copy()
+            for _ in range(self.max_depth + 1):
+                f = feature[node]
+                is_leaf = f < 0
+                if is_leaf.all():
+                    break
+                x = flat_bins[row_offset + np.maximum(f, 0)]
+                go_left = np.where(x == self.nan_bin, nan_left[node], x <= split_bin[node])
+                node = np.where(is_leaf, node, np.where(go_left, left[node], right[node]))
+            values = leaf[node]  # [rows, T, Lw]
+            if out_col is not None:
+                dense = np.zeros((rows, T, K), dtype=np.float32)
+                dense[:, np.arange(T), out_col[:T]] = values[..., 0]
+                values = dense
+            # Sequential float32 sums over the trees, the same additions as the CUDA kernel
+            cum = np.add.accumulate(values, axis=1)
+            for p, t in enumerate(tree_counts):
+                acc = cum[:, t - 1] if t > 0 else np.zeros((rows, K), dtype=np.float32)
+                out[p, start : start + chunk] = base + acc
         return out
 
     # ─── Fit ───
@@ -871,11 +1040,28 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.num_eras = len(self.unique_eras)
         self.era_indices = self.era_indices.to(dtype=torch.int32)
 
+        # Training reads one feature at a time: feature-major bins [F, N] (coalesced reads)
+        self.bins_fm = self.bin_indices.T.contiguous()
+        self.bin_indices = None
+        self._row_ids = torch.arange(self.num_samples, device=self.device)
+        self._ones_i64 = torch.ones(self.num_samples, dtype=torch.int64, device=self.device)
+
         self.Y_gpu, self.tw = self._build_targets(y_prepared, sample_weight)
-        self.row_weight_gpu = self.tw.row_weight.contiguous()
-        self._count_scale = self._fixed_point_scale(
-            self.row_weight_gpu, self.threads_per_block * self.rows_per_thread
+        # If every hessian equals the row weight (squared error without missing targets and with
+        # the same weight for all outputs), the hessian sums are read from the row-weight
+        # histogram instead of being accumulated (K + 1 instead of 2K + 1 channels)
+        weight = self.tw.weight
+        self._unit_hessian = self.objective_._hessian_is_one() and bool(
+            (weight == weight[:, :1]).all()
         )
+        self.row_weight_gpu = (weight[:, 0] if self._unit_hessian else self.tw.row_weight).contiguous()
+        self._tile_rows_ = self._tile_rows(self.num_eras, self.num_bins + 1)
+        self._count_scale = self._device_scale(self.row_weight_gpu)
+        self._has_monotone = bool(np.any(self.monotonic_constraints_vector_))
+        self._mono_vec_gpu = torch.from_numpy(self.monotonic_constraints_vector_).to(self.device)
+        free_bytes, _ = torch.cuda.mem_get_info(torch.device(self.device))
+        self._hist_budget = _HIST_MEMORY_FRACTION * free_bytes
+        self._tree_graphs = {}
 
         # ─── Initial scores ───
         if continuing:
@@ -899,11 +1085,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 )
             self._store_base_score(base)
 
-        self.scores = self._predict_raw_binned(self.bin_indices, self._trees_trained)
+        self.scores = self._predict_raw_binned(self.bins_fm, self._trees_trained, feature_major=True)
         self._best_train_scores = None
         self._train_aux = self._aux_tensor(train_aux)
 
-        self.root_node_indices = torch.arange(self.num_samples, device=self.device, dtype=torch.int32)
         self.feature_indices = torch.arange(self.num_features, device=self.device, dtype=torch.int32)
 
         # ─── Optional Eval Set ───
@@ -918,7 +1103,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.eval_metric_name_ = self._metric_name(self.eval_metric)
             self.eval_metric_higher_is_better_ = self._higher_is_better(self.eval_metric)
             self._eval_aux = self._aux_tensor(eval_aux)
-            self._eval_scores = self._predict_raw_binned(self.bin_indices_eval, self._trees_trained)
+            # Tree sums without the base score, see _add_round_to_eval_scores
+            zero = torch.zeros(self.num_outputs, dtype=torch.float32, device=self.device)
+            self._eval_acc = self._predict_raw_staged_binned(
+                self.bin_indices_eval, [self._trees_trained], base=zero
+            )[0]
+            self._eval_scores = self._base_score_tensor() + self._eval_acc
         else:
             self.bin_indices_eval = None
             self.Y_gpu_eval = None
@@ -927,6 +1117,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.early_stopping_rounds = None
             self._eval_aux = None
             self._eval_scores = None
+            self._eval_acc = None
 
         # ─── Grow the forest ───
         with torch.no_grad():
@@ -940,6 +1131,11 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         # Release training buffers
         self.bin_indices = None
+        self.bins_fm = None
+        self._row_ids = None
+        self._ones_i64 = None
+        self._tree_graphs = {}
+        self._eval_acc = None
         self.Y_gpu = None
         self.tw = None
         self.scores = None
@@ -952,8 +1148,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._train_aux = None
         self._best_train_scores = None
         self._rng = None
-
-        gc.collect()
 
         return self
 
@@ -1055,296 +1249,396 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             bin_indices = _bin_matrix(X_gpu, bin_edges, self.nan_bin)
             return bin_indices, era_indices, bin_edges, unique_eras
 
-    def compute_histograms(self, sample_indices, feature_indices, grad, hess):
-        num_hist_bins = self.num_bins + 1  # value bins + NaN bin
-        num_channels = grad.shape[1]
-        # The kernel overwrites its outputs
-        grad_hist = torch.empty(
-            (self.num_eras, len(feature_indices), num_hist_bins, num_channels),
-            device=self.device,
-            dtype=torch.float32,
-        )
-        hess_hist = torch.empty_like(grad_hist)
-        count_hist = torch.empty(
-            (self.num_eras, len(feature_indices), num_hist_bins),
-            device=self.device,
-            dtype=torch.float32,
-        )
-
-        _get_node_kernel().compute_histogram3(
-            self.bin_indices,
-            grad,
-            hess,
-            self.row_weight_gpu,
-            sample_indices,
-            feature_indices,
-            self.era_indices,
-            grad_hist,
-            hess_hist,
-            count_hist,
-            num_hist_bins,
-            *self._hist_scales,
-            self.threads_per_block,
-            self.rows_per_thread,
-        )
-        return grad_hist, hess_hist, count_hist
+    # ─── Tree growing ───
+    #
+    # Trees are grown level by level; all nodes of a level are handled by a few kernel launches,
+    # without host syncs:
+    #   1. node totals (node_sums) -> leaf values and monotone bounds;
+    #   2. histograms [nodes, F, E, B, C] of the level: the smaller child of every split is built
+    #      and its sibling is parent - child (exact integer subtraction in deterministic mode);
+    #   3. split candidates of all nodes (level_split) and the best split per node (select_split);
+    #   4. rows move to their child (heap numbering: the children of node j are 2j and 2j + 1).
+    # Nodes are numbered densely per level; nodes below a leaf are inactive and cost nothing. Trees
+    # are full-depth with independent node splits, so this grows the same trees as a depth-first
+    # recursion. The tree is copied to the host once, at the end.
+    #
+    # Histogram channels C = Kc + Kh + 1: gradients, hessians (Kh = 0 when every hessian equals
+    # the row weight, see fit) and row weights. Blocks accumulate fixed-point integers; with
+    # deterministic=True the histograms are int64 (exact, order independent), with
+    # deterministic=False float32 (float atomics, half the memory and traffic).
 
     @staticmethod
-    def _fixed_point_scale(values, rows_per_block):
-        """
-        Power-of-two scale for the deterministic fixed-point histogram accumulation
-        (see warpgbm/cuda/histogram_kernel.cu): the largest scale for which the sum of
-        one CUDA block's rows cannot overflow the 32-bit shared-memory accumulators.
-        """
-        bound = float(values.abs().max()) * rows_per_block if values.numel() else 0.0
-        if not math.isfinite(bound) or bound <= 0.0:
-            return 1.0
-        exponent = math.floor(math.log2(2.0**30 / bound))
-        return 2.0 ** max(-126, min(126, exponent))
+    def _tile_rows(num_eras, num_hist_bins):
+        """Rows per histogram block; the fixed-point scales are derived from it."""
+        rows = 1024
+        while rows < 2 * num_eras * num_hist_bins and rows < 8192:
+            rows *= 2
+        return rows
 
-    def find_best_split(self, gradient_histogram, hessian_histogram, count_histogram):
-        _get_node_kernel().compute_split(
-            gradient_histogram,
-            hessian_histogram,
-            count_histogram,
+    def _device_scale(self, values):
+        """
+        Power-of-two fixed-point scale as a 0-d float32 tensor on the device (no host sync): the
+        largest scale for which one block's sum of |values| cannot overflow 32 bits.
+        """
+        one = torch.ones((), dtype=torch.float64, device=values.device)
+        if values.numel() == 0:
+            return one.float()
+        bound = values.abs().amax().double() * self._tile_rows_
+        x = (2.0**30) / bound
+        _, exponent = torch.frexp(x)  # x = m * 2^exponent with m in [0.5, 1)
+        scale = torch.ldexp(one, (exponent - 1).clamp(-126, 126))
+        return torch.where(torch.isfinite(x) & (bound > 0), scale, one).float()
+
+    @staticmethod
+    def _acc_to_float(acc, scales, Kc, Kh):
+        """Float values of fixed-point sums [..., C] (identity for float sums)."""
+        if acc.dtype != torch.int64:
+            return acc
+        # Powers of two: int64 -> float rounds once, the scaling is exact (as in the split kernel)
+        inv = 1.0 / scales
+        inv = torch.cat([inv[0].expand(Kc), inv[1].expand(Kh), inv[2:3]])
+        return acc.float() * inv
+
+    def _count(self, index, n):
+        """Occurrences of 0 … n-1 in index [N] (bincount without its host sync)."""
+        counts = torch.zeros(n, dtype=torch.int64, device=self.device)
+        return counts.index_add_(0, index.long(), self._ones_i64[: index.numel()])
+
+    def _level_bytes(self, num_features, num_channels):
+        """(histogram bytes, split buffer bytes) per node."""
+        E, B, n_cand = self.num_eras, self.num_bins + 1, 2 * self.num_bins
+        elem = 8 if self.deterministic else 4
+        hist = num_features * E * B * num_channels * elem
+        split = num_features * n_cand * (4 * E + 9)
+        return hist, split
+
+    def _build_histograms(self, node, build, slot_of_node, max_rows, out, grad, hess_ch, scales):
+        """Histograms of the nodes with build[j] (rows with node_of_row == j) into out[slot_of_node[j]]."""
+        n_nodes = build.numel()
+        T = self._tile_rows_
+        key = torch.where(build[node.long()], node, n_nodes)
+        order = torch.argsort(key, stable=True).to(torch.int32)
+        seg_len = self._count(key, n_nodes + 1)[:n_nodes]
+        seg_start = torch.cumsum(seg_len, 0) - seg_len
+        tile_offset = torch.zeros(n_nodes + 1, dtype=torch.int64, device=self.device)
+        tile_offset[1:] = torch.cumsum((seg_len + T - 1) // T, 0)
+        _get_node_kernel().histogram_level(
+            self.bins_fm,
+            grad,
+            hess_ch,
+            self.row_weight_gpu,
+            order,
+            seg_start.to(torch.int32),
+            seg_len.to(torch.int32),
+            slot_of_node.to(torch.int32),
+            tile_offset.to(torch.int32),
+            self.feat_indices_tree,
+            self.era_indices,
+            out,
+            scales,
+            (max_rows + T - 1) // T + n_nodes,
+            T,
+        )
+
+    def _split_and_select(self, hist, active_u8, scales, mono_req, Kc, best, best_gain, best_era):
+        """Best split of every active node of hist [S, F, E, B, C] into best / best_gain / best_era."""
+        S, F = hist.shape[:2]
+        n_cand = 2 * self.num_bins
+        kernel = _get_node_kernel()
+        era_gain = torch.empty((S, F, self.num_eras, n_cand), device=self.device)
+        gain = torch.empty((S, F, n_cand), device=self.device)
+        agree = torch.empty_like(gain)
+        mono_ok = None
+        if mono_req is not None:
+            mono_ok = torch.empty((S, F, n_cand), dtype=torch.uint8, device=self.device)
+        kernel.level_split(
+            hist,
+            active_u8,
+            scales,
+            mono_req,
             float(self.min_child_weight),
             float(self.min_sum_hessian),
-            self.L2_reg,
-            self.per_era_gain,
-            self.per_era_direction,
-            self.threads_per_block,
+            float(self.L2_reg),
+            Kc,
+            era_gain,
+            gain,
+            agree,
+            mono_ok,
+        )
+        kernel.select_split(
+            gain, agree, mono_ok, era_gain, active_u8, float(self.min_split_gain),
+            best, best_gain, best_era,
         )
 
-        if self.num_eras == 1:
-            era_splitting_criterion = self.per_era_gain[0,:,:]  # [F, 2 * num_bins]
-            dir_score_mask = era_splitting_criterion > self.min_split_gain
-        else:
-            directional_agreement = self.per_era_direction.mean(dim=0).abs()  # [F, 2 * num_bins]
-            era_splitting_criterion = self.per_era_gain.mean(dim=0)  # [F, 2 * num_bins]
-            dir_score_mask = ( directional_agreement == directional_agreement.max() ) & (era_splitting_criterion > self.min_split_gain)
+    def _level_splits(self, d, node, active, counts, prev, grad, hess_ch, scales, mono_req):
+        """
+        Best split per node of level d. prev = [histograms of level d - 1 or None]; the list holds
+        the only reference, so they are released as soon as possible. Returns (best [n],
+        best_gain [n], best_era [n, E], hist), hist being the level's histograms if they fit
+        into the memory budget (else None).
+        """
+        hist_prev = prev.pop()
+        n_d = 1 << d
+        dev = self.device
+        Kc, C = grad.shape[1], grad.shape[1] + hess_ch.shape[1] + 1
+        F = self.feat_indices_tree.numel()
+        shape = (F, self.num_eras, self.num_bins + 1, C)
+        dtype = torch.int64 if self.deterministic else torch.float32
+        hist_bytes, split_bytes = self._level_bytes(F, C)
+        best = torch.empty(n_d, dtype=torch.int32, device=dev)
+        best_gain = torch.empty(n_d, dtype=torch.float32, device=dev)
+        best_era = torch.empty((n_d, self.num_eras), dtype=torch.float32, device=dev)
+        active_u8 = active.to(torch.uint8)
+        slots = torch.arange(n_d, dtype=torch.int32, device=dev)
 
-        # Checked on the host once per tree, so unconstrained models skip this without a sync
-        if self._tree_has_monotone:
-            local_required_dirs = self.monotonic_required_split_direction_gpu_[
-                self.feat_indices_tree.to(torch.long)
-            ]
-            row_mask = (local_required_dirs != 0).view(-1, 1)
-            required = local_required_dirs.to(self.per_era_direction.dtype).view(-1, 1)
-
-            if self.num_eras == 1:
-                local_dirs = self.per_era_direction[0, :, :]
-                monotonic_mask = (~row_mask) | (local_dirs == required)
+        n_prev = n_d // 2 if hist_prev is not None else 0
+        if (n_prev + n_d) * hist_bytes + n_d * split_bytes <= self._hist_budget:
+            if hist_prev is None:
+                hist = torch.zeros((n_d,) + shape, dtype=dtype, device=dev)
+                self._build_histograms(node, active, slots, self.num_samples, hist, grad, hess_ch, scales)
             else:
-                all_era_matches = (
-                    self.per_era_direction == required.unsqueeze(0)
-                ).all(dim=0)
-                monotonic_mask = (~row_mask) | all_era_matches
+                # Build the smaller child of every split; its sibling is parent - child. Slots of
+                # inactive nodes are never read, so only the built slots are zeroed.
+                pairs = counts.view(-1, 2)
+                left_smaller = (pairs[:, 0] <= pairs[:, 1]).contiguous()
+                build = torch.stack([left_smaller, ~left_smaller], dim=1).reshape(-1) & active
+                hist = torch.empty((n_d,) + shape, dtype=dtype, device=dev)
+                built = 2 * torch.arange(n_d // 2, device=dev) + (~left_smaller).long()
+                hist.index_fill_(0, built, 0)
+                self._build_histograms(
+                    node, build, slots, self.num_samples // 2, hist, grad, hess_ch, scales
+                )
+                split = active.view(-1, 2)[:, 0].contiguous()
+                _get_node_kernel().sibling_subtract(hist, hist_prev, left_smaller, split)
+            del hist_prev
+            self._split_and_select(hist, active_u8, scales, mono_req, Kc, best, best_gain, best_era)
+            return best, best_gain, best_era, hist
 
-            dir_score_mask = dir_score_mask & monotonic_mask
-
-        masked_criterion = torch.where(
-            dir_score_mask, era_splitting_criterion, float("-inf")
-        )
-        # max() returns the first maximal index, like argmax; fetch value and index in one sync
-        best_val, best_idx = torch.max(masked_criterion.view(-1), dim=0)
-        best_val, best_idx = torch.stack([best_val.double(), best_idx.double()]).tolist()
-        if best_val == float("-inf"):
-            return -1, -1
-
-        best_feature, best_candidate = divmod(int(best_idx), 2 * self.num_bins)
-        return best_feature, best_candidate
-
-    def _go_left(self, bins, split_bin, nan_left):
-        """Routing rule shared by training and prediction (see predict.cu)."""
-        # The NaN bin lies above every value bin, so `bins <= split_bin` already sends NaN right
-        go_left = bins <= split_bin
-        if nan_left:
-            go_left |= bins == self.nan_bin
-        return go_left
-
-    def _leaf_value(self, node_indices):
-        gh = torch.sum(self._tree_grad_hess[node_indices], dim=0)
-        num_channels = gh.shape[0] // 2
-        return gh[:num_channels] / (gh[num_channels:] + self.L2_reg)
-
-    def _make_leaf(self, node_indices, lower, upper):
-        leaf_value = self._leaf_value(node_indices)
-        if self._tree_has_monotone:
-            leaf_value = torch.clamp(leaf_value, min=lower, max=upper)
-
-        if self._tree_score_col is not None:
-            # One tree per score column: update that column only
-            self.scores[node_indices, self._tree_score_col] += (
-                self.learning_rate * leaf_value[0]
+        # Too large to keep a whole level: chunks of nodes, each child built directly
+        del hist_prev
+        chunk = max(1, int(self._hist_budget // (hist_bytes + split_bytes)))
+        for a in range(0, n_d, chunk):
+            b = min(n_d, a + chunk)
+            in_chunk = active & (slots >= a) & (slots < b)
+            hist = torch.zeros((b - a,) + shape, dtype=dtype, device=dev)
+            self._build_histograms(
+                node, in_chunk, (slots - a).clamp(min=0), self.num_samples, hist, grad, hess_ch, scales
             )
-        else:
-            self.scores[node_indices] += self.learning_rate * leaf_value
+            self._split_and_select(
+                hist, active_u8[a:b], scales, mono_req, Kc, best[a:b], best_gain[a:b], best_era[a:b]
+            )
+            del hist
+        return best, best_gain, best_era, None
 
-        # Leaf values are copied to the host once per tree (see _grow_single_tree)
-        leaf = {"leaf_value": None, "samples": node_indices.numel()}
-        self._pending_leaves.append((leaf, leaf_value))
-        return leaf
+    @staticmethod
+    def _child_bounds(raw_val, lower, upper, constraint):
+        """
+        Monotone value bounds [2n, Kc] of the children of n parents (bounds [n, Kc], constraint [n]
+        of the split feature): mid = mean of the children's clamped values bounds both sides.
+        """
+        n = lower.shape[0]
+        children = raw_val.view(n, 2, -1)
+        left_val = torch.clamp(children[:, 0], min=lower, max=upper)
+        right_val = torch.clamp(children[:, 1], min=lower, max=upper)
+        mid = 0.5 * (left_val + right_val)
+        inc = (constraint > 0).view(-1, 1)
+        dec = (constraint < 0).view(-1, 1)
+        left_lower = torch.where(dec, torch.maximum(lower, mid), lower)
+        left_upper = torch.where(inc, torch.minimum(upper, mid), upper)
+        right_lower = torch.where(inc, torch.maximum(lower, mid), lower)
+        right_upper = torch.where(dec, torch.minimum(upper, mid), upper)
+        new_lower = torch.stack([left_lower, right_lower], dim=1).reshape(2 * n, -1)
+        new_upper = torch.stack([left_upper, right_upper], dim=1).reshape(2 * n, -1)
+        return new_lower, new_upper
 
-    def grow_tree(
-        self,
-        gradient_histogram,
-        hessian_histogram,
-        count_histogram,
-        node_indices,
-        depth,
-        lower,
-        upper,
-    ):
-        if depth == self.max_depth:
-            return self._make_leaf(node_indices, lower, upper)
+    def _run_tree(self, grad, hess):
+        """
+        (score update [N, Kc], records) of one tree, see _grow_tree_device.
 
-        local_feature, best_candidate = self.find_best_split(
-            gradient_histogram, hessian_histogram, count_histogram
-        )
-
-        if local_feature == -1:
-            return self._make_leaf(node_indices, lower, upper)
-
-        nan_left = best_candidate >= self.num_bins
-        best_bin = best_candidate % self.num_bins
-
-        # Track feature importance: accumulate per-era gains for the chosen feature
-        global_feature_idx = self._feat_indices_cpu[local_feature]
-        split_gain = self.per_era_gain[:, local_feature, best_candidate]  # [num_eras]
-        self._feature_importance_gpu[:, global_feature_idx] += split_gain
-        split_gain_total = split_gain.sum()
-
-        split_mask = self._go_left(
-            self.bin_indices[node_indices, global_feature_idx], best_bin, nan_left
-        )
-        left_indices = node_indices[split_mask]
-        right_indices = node_indices[~split_mask]
-
-        # ─── Monotonic constraints: propagate value bounds to the children ───
-        left_lower, left_upper = lower, upper
-        right_lower, right_upper = lower, upper
-        constraint = int(self.monotonic_constraints_vector_[global_feature_idx])
-        if constraint != 0:
-            left_val = torch.clamp(self._leaf_value(left_indices), min=lower, max=upper)
-            right_val = torch.clamp(self._leaf_value(right_indices), min=lower, max=upper)
-            mid = 0.5 * (left_val + right_val)
-            if constraint > 0:
-                left_upper = torch.minimum(upper, mid)
-                right_lower = torch.maximum(lower, mid)
+        Every tree of a fit launches the same kernels on tensors of the same shapes, without host
+        syncs. The second tree of each shape is therefore captured as a CUDA graph, and later
+        trees replay it: one launch instead of ~100 small ones per tree. Inputs that change
+        between trees (gradients, hessians, sampled features) are copied into the graph's static
+        buffers. The first tree runs eagerly (warms up the kernels and the caching allocator).
+        """
+        key = grad.shape[1]
+        state = self._tree_graphs.get(key) if self._use_cuda_graphs else "eager"
+        if state is None or state == "eager":
+            if state is None:
+                self._tree_graphs[key] = "capture"
+            return self._grow_tree_device(grad, hess)
+        with torch.cuda.device(self.device):
+            if state == "capture":
+                static = (grad.clone(), hess.clone(), self.feat_indices_tree.clone())
+                graph = torch.cuda.CUDAGraph()
+                sampled = self.feat_indices_tree
+                self.feat_indices_tree = static[2]
+                try:
+                    with _GRAPH_CAPTURE_LOCK, torch.cuda.graph(graph, capture_error_mode=_CAPTURE_MODE):
+                        outputs = self._grow_tree_device(static[0], static[1])
+                except RuntimeError:
+                    # Capture is an optimization only: fall back to eager trees
+                    self._tree_graphs[key] = "eager"
+                    return self._grow_tree_device(grad, hess)
+                finally:
+                    self.feat_indices_tree = sampled
+                state = self._tree_graphs[key] = (graph, static, outputs)
             else:
-                left_lower = torch.maximum(lower, mid)
-                right_upper = torch.minimum(upper, mid)
+                graph, static, outputs = state
+                static[0].copy_(grad)
+                static[1].copy_(hess)
+                static[2].copy_(self.feat_indices_tree)
+            state[0].replay()
+            return state[2]
 
-        if left_indices.numel() <= right_indices.numel():
-            grad_hist_left, hess_hist_left, count_hist_left = self.compute_histograms(
-                left_indices,
-                self.feat_indices_tree,
-                self._tree_grad,
-                self._tree_hess,
+    def _grow_tree_device(self, grad, hess):
+        """
+        Grow one tree on the GPU, without host syncs. Returns the training score update
+        [N, Kc] and the tree as a float64 record tensor (see _tree_from_records).
+        """
+        kernel = _get_node_kernel()
+        dev = self.device
+        N = self.num_samples
+        Kc = grad.shape[1]
+        hess_ch = hess[:, :0] if self._unit_hessian else hess
+        Kh = hess_ch.shape[1]
+        C = Kc + Kh + 1
+        D = self.max_depth
+        Bv = self.num_bins
+        n_cand = 2 * Bv
+        feats = self.feat_indices_tree.long()
+        mono = self._has_monotone
+        mono_req = (
+            self.monotonic_required_split_direction_gpu_[feats].contiguous() if mono else None
+        )
+        # Fixed-point scales of the shared-memory accumulation (both modes, see histogram_kernel.cu)
+        scales = torch.stack(
+            [self._device_scale(grad), self._device_scale(hess_ch), self._count_scale]
+        )
+        # Checked on the host with the tree, instead of a sync per round
+        finite = torch.isfinite(grad).all() & torch.isfinite(hess).all()
+
+        node = torch.zeros(N, dtype=torch.int32, device=dev)  # node of every row at level d
+        active = torch.ones(1, dtype=torch.bool, device=dev)
+        hist = None
+        lower = upper = constraint = None
+        leaf_val = None  # value of the leaf a node lies in (for nodes below a leaf)
+        records = []
+        for d in range(D + 1):
+            n_d = 1 << d
+            # 1. Node totals -> values (clamped to the monotone bounds)
+            sums = torch.zeros(
+                (n_d, C), dtype=torch.int64 if self.deterministic else torch.float32, device=dev
             )
-            grad_hist_right = gradient_histogram - grad_hist_left
-            hess_hist_right = hessian_histogram - hess_hist_left
-            count_hist_right = count_histogram - count_hist_left
-        else:
-            grad_hist_right, hess_hist_right, count_hist_right = self.compute_histograms(
-                right_indices,
-                self.feat_indices_tree,
-                self._tree_grad,
-                self._tree_hess,
+            # Blocks of at most tile_rows rows keep the fixed-point sums within 32 bits
+            kernel.node_sums(
+                node, grad, hess_ch, self.row_weight_gpu, sums, scales, min(256, self._tile_rows_)
             )
-            grad_hist_left = gradient_histogram - grad_hist_right
-            hess_hist_left = hessian_histogram - hess_hist_right
-            count_hist_left = count_histogram - count_hist_right
+            sums = self._acc_to_float(sums, scales, Kc, Kh)
+            G = sums[:, :Kc]
+            H = sums[:, Kc : Kc + Kh] if Kh else sums[:, -1:].expand(-1, Kc)
+            val = G / (H + self.L2_reg)
+            if mono:
+                if d == 0:
+                    lower = torch.full((1, Kc), float("-inf"), device=dev)
+                    upper = torch.full((1, Kc), float("inf"), device=dev)
+                else:
+                    lower, upper = self._child_bounds(val, lower, upper, constraint)
+                val = torch.clamp(val, min=lower, max=upper)
+            counts = self._count(node, n_d)
 
-        new_depth = depth + 1
-        left_child = self.grow_tree(
-            grad_hist_left,
-            hess_hist_left,
-            count_hist_left,
-            left_indices,
-            new_depth,
-            left_lower,
-            left_upper,
-        )
-        right_child = self.grow_tree(
-            grad_hist_right,
-            hess_hist_right,
-            count_hist_right,
-            right_indices,
-            new_depth,
-            right_lower,
-            right_upper,
-        )
+            # 2./3. Best split of every active node
+            if d < D:
+                prev, hist = [hist], None
+                best, best_gain, best_era, hist = self._level_splits(
+                    d, node, active, counts, prev, grad, hess_ch, scales, mono_req
+                )
+                valid = best >= 0
+            else:
+                best = torch.full((n_d,), -1, dtype=torch.int32, device=dev)
+                best_gain = torch.zeros(n_d, device=dev)
+                best_era = torch.zeros((n_d, self.num_eras), device=dev)
+                valid = torch.zeros(n_d, dtype=torch.bool, device=dev)
+            leaf = active & ~valid
+            if leaf_val is None:
+                leaf_val = val
+            else:
+                leaf_val = torch.where(leaf[:, None], val, leaf_val.repeat_interleave(2, dim=0))
 
-        node = {
-            "feature": global_feature_idx,
-            "bin": best_bin,
-            "nan_left": bool(nan_left),
-            "left": left_child,
-            "right": right_child,
-        }
-        self._pending_gains.append((node, split_gain_total))
-        return node
+            candidate = best.clamp(min=0).long()
+            f_global = feats[candidate // n_cand]
+            candidate = candidate % n_cand
+            records.append(
+                torch.cat(
+                    [
+                        torch.stack(
+                            [t.double() for t in (active, valid, f_global, candidate, best_gain, counts)],
+                            dim=1,
+                        ),
+                        best_era.double(),
+                        val.double(),
+                    ],
+                    dim=1,
+                ).reshape(-1)
+            )
+            if d == D:
+                break
 
-    def _grow_single_tree(self, grad, hess, score_col=None):
-        """Grow one tree on gradient channels grad/hess [N, Kc] (negative-gradient convention)."""
-        self._tree_grad = grad
-        self._tree_hess = hess
-        self._tree_grad_hess = torch.cat([grad, hess], dim=1)  # one gather per leaf
-        self._tree_score_col = score_col
+            # 4. Rows move to their child; rows of leaves to the (inactive) left child
+            nl = node.long()
+            row_bins = self.bins_fm.view(-1)[f_global[nl] * N + self._row_ids]
+            split_bin = (candidate % Bv)[nl]
+            nan_left = (candidate >= Bv)[nl]
+            go_left = (row_bins <= split_bin) | (nan_left & (row_bins == self.nan_bin))
+            node = node * 2 + (valid[nl] & ~go_left).to(torch.int32)
+            if mono:
+                constraint = torch.where(valid, self._mono_vec_gpu[f_global], 0)
+            active = valid.repeat_interleave(2)
 
-        self._feat_indices_cpu = self.feat_indices_tree.tolist()
-        self._tree_has_monotone = bool(
-            np.any(self.monotonic_constraints_vector_[self._feat_indices_cpu])
-        )
-        self._pending_leaves = []
-        self._pending_gains = []
+        # Training scores: every row gets the value of its leaf
+        update = leaf_val[node.long()] * self.learning_rate
+        records.append(finite.double().view(1))
+        return update, torch.cat(records)
 
-        rows_per_block = self.threads_per_block * self.rows_per_thread
-        self._hist_scales = (
-            self._fixed_point_scale(grad, rows_per_block),
-            self._fixed_point_scale(hess, rows_per_block),
-            self._count_scale,
-        )
+    def _tree_from_records(self, host, Kc):
+        """
+        Tree dict from the records of _grow_tree_device: per level d, [2^d, 6 + E + Kc] rows
+        (active, valid split, feature, candidate, gain, rows, per-era gains, node values),
+        then the finiteness flag of the gradients.
+        """
+        if not host[-1]:
+            raise FloatingPointError(
+                f"Objective {self.objective_!r} produced non-finite gradients or hessians."
+            )
+        D = self.max_depth
+        Bv = self.num_bins
+        E = self.num_eras
+        width = 6 + E + Kc
+        levels = []
+        offset = 0
+        for d in range(D + 1):
+            levels.append(host[offset : offset + (width << d)].reshape(1 << d, width))
+            offset += width << d
+        importance = self._feature_importance_acc
 
-        num_channels = grad.shape[1]
-        lower = torch.full((num_channels,), float("-inf"), device=self.device)
-        upper = torch.full((num_channels,), float("inf"), device=self.device)
+        def build(d, j):
+            r = levels[d][j]
+            if r[1]:
+                feature, cand = int(r[2]), int(r[3])
+                # Pre-order, like the order in which splits are made
+                importance[:, feature] += r[6 : 6 + E].astype(np.float32)
+                node = {"feature": feature, "bin": cand % Bv, "nan_left": cand >= Bv}
+                node["left"] = build(d + 1, 2 * j)
+                node["right"] = build(d + 1, 2 * j + 1)
+                node["gain"] = float(r[4])
+                return node
+            value = r[6 + E :]
+            return {
+                "leaf_value": float(value[0]) if Kc == 1 else [float(v) for v in value],
+                "samples": int(r[5]),
+            }
 
-        root_grad_hist, root_hess_hist, root_count_hist = self.compute_histograms(
-            self.root_node_indices,
-            self.feat_indices_tree,
-            grad,
-            hess,
-        )
-        tree = self.grow_tree(
-            root_grad_hist,
-            root_hess_hist,
-            root_count_hist,
-            self.root_node_indices,
-            0,
-            lower,
-            upper,
-        )
-        self._tree_grad = None
-        self._tree_hess = None
-        self._tree_grad_hess = None
-
-        # One device -> host transfer per tree: leaf values and split gains
-        leaf_values = torch.stack([v for _, v in self._pending_leaves])  # [L, Kc]
-        num_leaves, num_channels = leaf_values.shape
-        packed = [leaf_values.reshape(-1)]
-        if self._pending_gains:
-            packed.append(torch.stack([g for _, g in self._pending_gains]).to(leaf_values.dtype))
-        host = torch.cat(packed).cpu().tolist()
-        for j, (leaf, _) in enumerate(self._pending_leaves):
-            value = host[j * num_channels : (j + 1) * num_channels]
-            leaf["leaf_value"] = value[0] if num_channels == 1 else value
-        for (node, _), gain in zip(self._pending_gains, host[num_leaves * num_channels :]):
-            node["gain"] = gain
-        self._pending_leaves = []
-        self._pending_gains = []
-        return tree
+        return build(0, 0)
 
     def grow_forest(self):
         """Gradient boosting loop shared by all objectives."""
@@ -1362,7 +1656,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         self.stop = False
         self._evals_since_best = 0
-        self._best_importance_gpu = None
+        self._best_importance = None
         strategy = self._output_strategy()
 
         if self.colsample_bytree < 1.0:
@@ -1371,13 +1665,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.feat_indices_tree = self.feature_indices
             k = self.num_features
 
-        self._feature_importance_gpu = torch.zeros(
-            (self.num_eras, self.num_features), device=self.device, dtype=torch.float32
-        )
-
-        num_candidates = 2 * self.num_bins
-        self.per_era_gain = torch.zeros(self.num_eras, k, num_candidates, device=self.device, dtype=torch.float32)
-        self.per_era_direction = torch.zeros(self.num_eras, k, num_candidates, device=self.device, dtype=torch.float32)
+        # Per-era split gains of this fit, accumulated on the host in split order (deterministic)
+        self._feature_importance_acc = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
 
         # Warm start: start from where we left off
         start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
@@ -1388,9 +1677,16 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             # Ensure forest has enough slots
             self.forest.extend([{} for _ in range(self.n_estimators - len(self.forest))])
 
+        # Software pipeline: round i + 1 is enqueued on the GPU before the host turns round i
+        # into tree dicts and evaluates it, so host work overlaps with GPU work. When early
+        # stopping ends training at round i, the speculative round i + 1 is dropped; its score
+        # update does not matter then (training stops with a rollback to the best round).
+        pending = None
         for i in range(start_iter, self.n_estimators):
+            # Finiteness is checked with the tree's host transfer (see _tree_from_records)
             g, h = compute_grad_hess(
-                self.objective_, self.Y_gpu, self.scores, self.tw.weight, self.tw.mask
+                self.objective_, self.Y_gpu, self.scores, self.tw.weight, self.tw.mask,
+                check_finite=False,
             )
             # Trees are grown on the negative gradient: leaf = sum(-g) / (sum(h) + L2)
             neg_grad = -g
@@ -1401,35 +1697,35 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 )[:k]
 
             if strategy == PER_OUTPUT:
-                round_trees = []
-                for col in range(self.num_outputs):
-                    round_trees.append(
-                        self._grow_single_tree(
-                            neg_grad[:, col : col + 1].contiguous(),
-                            h[:, col : col + 1].contiguous(),
-                            score_col=col,
-                        )
+                launched = [
+                    self._launch_tree(
+                        neg_grad[:, col : col + 1].contiguous(),
+                        h[:, col : col + 1].contiguous(),
+                        score_col=col,
                     )
-                self.forest.append(round_trees)
+                    for col in range(self.num_outputs)
+                ]
             else:
-                round_trees = self._grow_single_tree(neg_grad, h)
-                self.forest[i] = round_trees
+                launched = [self._launch_tree(neg_grad, h)]
+            # Training scores after round i, for its evaluation (self.scores moves on)
+            round_scores = self.scores.clone() if self.eval_every_n_trees is not None else None
 
-            self._trees_trained = i + 1
-            self._invalidate_prediction_cache()
-
-            self.compute_eval(i, round_trees)
-
-            if self.stop:
-                break
+            if pending is not None:
+                self._finish_round(*pending)
+                pending = None
+                if self.stop:
+                    break
+            pending = (i, launched, round_scores)
+        if pending is not None:
+            self._finish_round(*pending)
 
         # Per-era importance of all trees, and of the best round of this fit
         if base_known:
-            self._per_era_importance_all = base + self._feature_importance_gpu.cpu().numpy()
-            if self._best_importance_gpu is not None:
-                self._per_era_importance_best = base + self._best_importance_gpu.cpu().numpy()
-        self._feature_importance_gpu = None
-        self._best_importance_gpu = None
+            self._per_era_importance_all = base + self._feature_importance_acc
+            if self._best_importance is not None:
+                self._per_era_importance_best = base + self._best_importance
+        self._feature_importance_acc = None
+        self._best_importance = None
         self._is_fitted = True
         self._update_importance_attributes()
 
@@ -1438,6 +1734,32 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 print(f"Finished training {self.objective_.name} forest. Total rounds: {self._trees_trained} ({self._trees_trained * self.num_outputs} trees)")
             else:
                 print(f"Finished training {self.objective_.name} forest. Total trees: {self._trees_trained}")
+
+    def _launch_tree(self, grad, hess, score_col=None):
+        """Enqueue one tree: updates the training scores, starts the copy of its records."""
+        update, records = self._run_tree(grad, hess)
+        if score_col is not None:
+            self.scores[:, score_col] += update[:, 0]
+        else:
+            self.scores += update
+        host = torch.empty(records.shape, dtype=records.dtype, pin_memory=True)
+        host.copy_(records, non_blocking=True)
+        done = torch.cuda.Event()
+        done.record()
+        return host, done, grad.shape[1]
+
+    def _finish_round(self, i, launched, round_scores):
+        """Turn the records of round i into tree dicts, store and evaluate the round."""
+        trees = []
+        for host, done, Kc in launched:
+            done.synchronize()
+            trees.append(self._tree_from_records(host.numpy(), Kc))
+        if self._output_strategy() == PER_OUTPUT:
+            self.forest.append(trees)
+        else:
+            self.forest[i] = trees[0]
+        self._trees_trained = i + 1
+        self.compute_eval(i, round_scores)
 
     # ─── Evaluation ───
 
@@ -1502,18 +1824,28 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             return True
         return score > best if self.eval_metric_higher_is_better_ else score < best
 
-    def _add_round_to_eval_scores(self, round_trees):
-        """Incrementally add the newest round to the eval scores (avoids re-flattening the forest)."""
-        groups = self._trees_per_output([round_trees])
-        self._accumulate_tree_tensors(
-            self.bin_indices_eval, self._flatten_groups(groups), self._eval_scores
-        )
+    def _add_round_to_eval_scores(self, i):
+        """
+        Add round i to the eval scores. The tree sums are accumulated with the same additions as
+        the prediction kernel, so the eval scores equal predict_raw(X_eval, num_trees=i + 1).
+        """
+        self._ensure_packed(i + 1)
+        nodes, leaf, out_col = (self._to_device(a) for a in self._pack_rounds[i])
+        if self._output_strategy() != PER_OUTPUT:
+            out_col = None
+        self._eval_acc = self._forest_kernel(
+            self.bin_indices_eval, nodes, leaf, out_col, self._eval_acc, [nodes.size(0)]
+        )[0]
+        self._eval_scores = self._base_score_tensor() + self._eval_acc
 
-    def compute_eval(self, i, round_trees):
+    def compute_eval(self, i, train_scores=None):
+        """Evaluate round i; train_scores are the training scores after round i (default: current)."""
         if self.eval_every_n_trees is None:
             return
+        if train_scores is None:
+            train_scores = self.scores
 
-        self._add_round_to_eval_scores(round_trees)
+        self._add_round_to_eval_scores(i)
 
         obj = self.objective_
         loss_name = "loss" if obj.has_loss() else "mse"
@@ -1521,7 +1853,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         # default it is only computed at evaluation checkpoints
         train_loss = None
         if self.record_training_loss == "all":
-            train_loss = self._metric_value(loss_name, self.Y_gpu, self.scores, self.tw)
+            train_loss = self._metric_value(loss_name, self.Y_gpu, train_scores, self.tw)
             self.training_loss.append(train_loss)
 
         # Evaluate every eval_every_n_trees rounds and always at the last round, so that the
@@ -1538,7 +1870,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         if self._train_aux is not None or not (
             callable(metric) and self._aux_mode(metric) == "required"
         ):
-            train_score = self._metric_value(metric, self.Y_gpu, self.scores, self.tw, self._train_aux)
+            train_score = self._metric_value(metric, self.Y_gpu, train_scores, self.tw, self._train_aux)
             self.evals_result_["train"].append(train_score)
         self.evals_result_["eval"].append(eval_score)
         self.eval_iterations_.append(i + 1)
@@ -1547,16 +1879,16 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             if isinstance(metric, str) and metric == loss_name and train_score is not None:
                 train_loss = train_score
             else:
-                train_loss = self._metric_value(loss_name, self.Y_gpu, self.scores, self.tw)
+                train_loss = self._metric_value(loss_name, self.Y_gpu, train_scores, self.tw)
             self.training_loss.append(train_loss)
 
         if self._is_better(eval_score, self.best_score_):
             self.best_score_ = eval_score
             self.best_iteration_ = i + 1
             self._evals_since_best = 0
-            self._best_importance_gpu = self._feature_importance_gpu.clone()
+            self._best_importance = self._feature_importance_acc.copy()
             if self._rollback:
-                self._best_train_scores = self.scores.clone()
+                self._best_train_scores = train_scores.clone()
         else:
             self._evals_since_best += 1
             if self._evals_since_best >= self.early_stopping_rounds:
@@ -1583,34 +1915,95 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             X_gpu = _to_float_gpu(X_np, self.device)
             return _bin_matrix(X_gpu, self.bin_edges.to(self.device), self.nan_bin)
 
+    def _check_input_shape(self, X_np, name):
+        if X_np.ndim != 2 or X_np.shape[1] != self.num_features:
+            raise ValueError(
+                f"{name} must have shape (n_samples, {self.num_features}), got {X_np.shape}."
+            )
+
     def bin_inference_data(self, X_np, name="X"):
         """
         Internal int8 bins [N, F] on the model device: raw features are binned with the fitted
         edges; for a pre-binned model (prebinned_), X_np must hold bin indices (-1 = missing).
         """
-        if X_np.ndim != 2 or X_np.shape[1] != self.num_features:
-            raise ValueError(
-                f"{name} must have shape (n_samples, {self.num_features}), got {X_np.shape}."
-            )
+        self._check_input_shape(X_np, name)
         if self.prebinned_:
             return _prebinned_to_gpu(X_np, self.num_bins, self.device, name)
         return self.bin_data_with_existing_edges(X_np)
 
-    def _predict_raw_binned(self, bin_indices, num_trees=None):
+    def _bin_inference_cpu(self, X_np, name="X"):
+        """bin_inference_data on the CPU: internal int8 bins [N, F] as a numpy array."""
+        self._check_input_shape(X_np, name)
+        if self.prebinned_:
+            return _prebinned_to_cpu(X_np, self.num_bins, name)
+        if self.bin_edges is None:
+            raise ValueError("This model has no bin edges (it was fitted on pre-binned data).")
+        if self._edges_cpu is None:
+            self._edges_cpu = self.bin_edges.detach().cpu().numpy().astype(np.float32, copy=False)
+        if torch.is_tensor(X_np):
+            X_np = X_np.detach().cpu().numpy()
+        return _bin_matrix_cpu(X_np, self._edges_cpu, self.nan_bin)
+
+    def _base_score_np(self):
+        """Initial raw score as a [K] float32 numpy array (cached)."""
+        if self._base_cpu is None:
+            base = self.base_prediction
+            K = self.num_outputs
+            if base is None:
+                base = np.zeros(K, dtype=np.float32)
+            elif torch.is_tensor(base):
+                base = base.detach().cpu().numpy()
+            base = np.asarray(base, dtype=np.float32).reshape(-1)
+            if base.size == 1 and K > 1:
+                base = np.repeat(base, K)
+            self._base_cpu = base
+        return self._base_cpu
+
+    @staticmethod
+    def _use_cpu(device):
+        """Prediction device: None -> the model's GPU, "cpu" -> the NumPy path."""
+        if device is None:
+            return False
+        try:
+            device_type = torch.device(device).type
+        except (RuntimeError, TypeError) as e:
+            raise ValueError(f"device must be None or 'cpu', got {device!r}.") from e
+        if device_type != "cpu":
+            raise ValueError(
+                f"device must be None (the model device) or 'cpu', got {device!r}."
+            )
+        return True
+
+    def _predict_raw_binned(self, bin_indices, num_trees=None, feature_major=False):
         """Raw scores [N, K] for binned data, using the first num_trees rounds (None: default model)."""
         num_trees = self._resolve_num_trees(num_trees)
-        num_samples = bin_indices.size(0)
-        out = (
-            torch.zeros(
-                (num_samples, self.num_outputs), device=self.device, dtype=torch.float32
+        return self._predict_raw_staged_binned(bin_indices, [num_trees], feature_major)[0]
+
+    def _staged_raw(self, X_np, rounds, device):
+        """Raw scores [P, N, K] (torch, on the GPU or the CPU) after each of rounds (ascending)."""
+        if self._use_cpu(device):
+            return torch.from_numpy(
+                self._predict_raw_staged_cpu(self._bin_inference_cpu(X_np), rounds)
             )
-            + self._base_score_tensor()
-        )
-        if num_trees > 0:
-            self._accumulate_tree_tensors(
-                bin_indices, self._get_cached_tree_tensors(num_trees), out
-            )
-        return out
+        bin_indices = self.bin_inference_data(X_np)
+        return self._predict_raw_staged_binned(bin_indices, rounds)
+
+    def _resolve_rounds(self, rounds):
+        """Validated round counts and the sorted unique ones: (rounds, unique, positions)."""
+        if isinstance(rounds, (int, np.integer)) and not isinstance(rounds, bool):
+            raise TypeError("rounds must be a sequence of round counts, e.g. [10, 20, 50].")
+        rounds = [self._resolve_num_trees(r) for r in rounds]
+        if not rounds:
+            raise ValueError("rounds must not be empty.")
+        unique = sorted(set(rounds))
+        positions = [unique.index(r) for r in rounds]
+        return unique, positions
+
+    def _output_shape(self, raw):
+        """Drop the output axis of single-output regression-like models ([..., N, 1] -> [..., N])."""
+        if not self.objective_.is_classifier and self._targets_1d and raw.shape[-1] == 1:
+            return raw[..., 0]
+        return raw
 
     def _check_fitted(self):
         if not self._is_fitted:
@@ -1619,29 +2012,26 @@ class WarpGBM(BaseEstimator, RegressorMixin):
     def predict_binned(self, bin_indices, num_trees=None):
         """Transformed predictions for binned data ([N] for single-output targets)."""
         pred = self.objective_.transform(self._predict_raw_binned(bin_indices, num_trees))
-        if not self.objective_.is_classifier and self._targets_1d and pred.shape[1] == 1:
-            return pred[:, 0]
-        return pred
+        return self._output_shape(pred)
 
-    def predict_raw(self, X_np, num_trees=None):
+    def predict_raw(self, X_np, num_trees=None, device=None):
         """
         Raw (untransformed) scores, e.g. logits for classification.
 
         num_trees: number of boosting rounds to use. None uses the default model, i.e.
         best_iteration_ after early stopping and all trained rounds otherwise.
+        device: None predicts on the model's GPU; "cpu" uses a NumPy implementation without any
+        CUDA call (lowest latency for a few rows). Both give identical raw scores (transforms
+        such as softmax may differ in the last bit).
 
         Returns shape (n_samples,) for single-output regression-like models, else (n_samples, K).
         """
         self._check_fitted()
         num_trees = self._resolve_num_trees(num_trees)
-        bin_indices = self.bin_inference_data(X_np)
-        raw = self._predict_raw_binned(bin_indices, num_trees).cpu().numpy()
-        del bin_indices
-        if not self.objective_.is_classifier and self._targets_1d and raw.shape[1] == 1:
-            return raw.reshape(-1)
-        return raw
+        raw = self._staged_raw(X_np, [num_trees], device)[0]
+        return self._output_shape(raw).cpu().numpy()
 
-    def predict(self, X_np, num_trees=None):
+    def predict(self, X_np, num_trees=None, device=None):
         """
         Predict on new data.
 
@@ -1650,25 +2040,25 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         num_trees: number of boosting rounds to use. None uses the default model, i.e.
         best_iteration_ after early stopping and all trained rounds otherwise.
+        device: None (model GPU) or "cpu", see predict_raw.
         """
         self._check_fitted()
         num_trees = self._resolve_num_trees(num_trees)
         if self.objective_.is_classifier:
             # Classification: return class labels
-            probs = self.predict_proba(X_np, num_trees)
+            probs = self.predict_proba(X_np, num_trees, device=device)
             class_indices = np.argmax(probs, axis=1)
             return self.label_encoder.inverse_transform(class_indices)
 
-        bin_indices = self.bin_inference_data(X_np)
-        preds = self.predict_binned(bin_indices, num_trees).cpu().numpy()
-        del bin_indices
-        return preds
+        raw = self._staged_raw(X_np, [num_trees], device)[0]
+        return self._output_shape(self.objective_.transform(raw)).cpu().numpy()
 
-    def predict_proba(self, X_np, num_trees=None):
+    def predict_proba(self, X_np, num_trees=None, device=None):
         """
         Predict class probabilities (classification only).
 
         num_trees: number of boosting rounds to use (None: default model, see predict).
+        device: None (model GPU) or "cpu", see predict_raw.
 
         Returns:
             np.array of shape (n_samples, n_classes) with probabilities
@@ -1677,11 +2067,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             raise ValueError("predict_proba only available for classification objectives")
         self._check_fitted()
         num_trees = self._resolve_num_trees(num_trees)
-
-        bin_indices = self.bin_inference_data(X_np)
-        probs = self.predict_proba_binned(bin_indices, num_trees).cpu().numpy()
-        del bin_indices
-        return probs
+        raw = self._staged_raw(X_np, [num_trees], device)[0]
+        return self.objective_.transform(raw).cpu().numpy()
 
     def predict_proba_binned(self, bin_indices, num_trees=None):
         """
@@ -1691,6 +2078,47 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             torch.Tensor of shape (n_samples, n_classes) with probabilities
         """
         return self.objective_.transform(self._predict_raw_binned(bin_indices, num_trees))
+
+    def staged_predict_raw(self, X_np, rounds, device=None):
+        """
+        Raw scores after several numbers of boosting rounds, from one pass over the forest.
+
+        rounds: sequence of round counts (0 … num_trees_), any order, duplicates allowed.
+        device: None (model GPU) or "cpu", see predict_raw.
+
+        Returns an array of shape (len(rounds), n_samples) for single-output regression-like
+        models, else (len(rounds), n_samples, K); entry p equals
+        predict_raw(X_np, num_trees=rounds[p]) exactly.
+        """
+        self._check_fitted()
+        unique, positions = self._resolve_rounds(rounds)
+        raw = self._staged_raw(X_np, unique, device)[positions]
+        return self._output_shape(raw).cpu().numpy()
+
+    def staged_predict(self, X_np, rounds, device=None):
+        """
+        predict() after several numbers of boosting rounds, from one pass over the forest.
+
+        Returns an array with a leading axis of length len(rounds): transformed predictions (class
+        labels for classifiers); entry p equals predict(X_np, num_trees=rounds[p]) exactly.
+        """
+        self._check_fitted()
+        unique, positions = self._resolve_rounds(rounds)
+        raw = self._staged_raw(X_np, unique, device)
+        pred = torch.stack([self.objective_.transform(r) for r in raw])[positions]
+        if self.objective_.is_classifier:
+            labels = torch.argmax(pred, dim=2).cpu().numpy()
+            return np.stack([self.label_encoder.inverse_transform(l) for l in labels])
+        return self._output_shape(pred).cpu().numpy()
+
+    def staged_predict_proba(self, X_np, rounds, device=None):
+        """predict_proba() after several numbers of boosting rounds: (len(rounds), n_samples, K)."""
+        if not self._is_classifier():
+            raise ValueError("staged_predict_proba only available for classification objectives")
+        self._check_fitted()
+        unique, positions = self._resolve_rounds(rounds)
+        raw = self._staged_raw(X_np, unique, device)
+        return torch.stack([self.objective_.transform(r) for r in raw])[positions].cpu().numpy()
 
     # ─── Feature importance ───
 
@@ -1865,7 +2293,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         if n != default_before:
             self.train_predictions_ = None
 
-        self._invalidate_prediction_cache()
+        self._invalidate_prediction_cache(keep_rounds=n)
         self.feature_importance_ = self._total_importance(n)
         self.per_era_feature_importance_ = era_importance
         return self
@@ -1916,6 +2344,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             "monotonic_constraints": self.monotonic_constraints,
             "prebinned": self.prebinned,
             "record_training_loss": self.record_training_loss,
+            "deterministic": self.deterministic,
             # Trained state
             "objective_": self.objective_,
             "forest": self.forest,
@@ -1999,6 +2428,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.prebinned = state.get("prebinned", None)
         # Older models used the training-time behaviour of their version: every round
         self.record_training_loss = state.get("record_training_loss", "all")
+        self.deterministic = state.get("deterministic", True)
 
         # Restore trained state
         self.objective_ = state.get("objective_") or resolve_objective(self.objective)

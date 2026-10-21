@@ -65,8 +65,6 @@ def test_fit_predictpytee_correlation():
         num_bins=127,
         n_estimators=50,
         learning_rate=1,
-        threads_per_block=128,
-        rows_per_thread=4,
         colsample_bytree=0.9,
         min_child_weight=4,
         # learning_rate=1 makes the result sensitive to the column draws (test MSE 0.008-0.09

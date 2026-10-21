@@ -19,8 +19,6 @@ def test_fit_predictpytee_correlation():
         num_bins=10,
         n_estimators=100,
         learning_rate=1,
-        threads_per_block=64,
-        rows_per_thread=4,
         colsample_bytree=1.0,
     )
 
