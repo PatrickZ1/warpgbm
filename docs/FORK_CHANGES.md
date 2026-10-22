@@ -175,6 +175,16 @@ load (tested).
   are on that device, and launches on `at::cuda::getCurrentCUDAStream()`. The histogram
   workspace and the shared-memory size queries therefore refer to the tensors' device.
   `WarpGBM(device="cuda:1")` works from any thread without `torch.cuda.set_device`.
+* **Current device (fix after 2.7.0).** The kernel guards were not enough: on 2.7.0 a fit on
+  `cuda:1` from a thread whose current device is `cuda:0` died with an illegal memory access
+  (2 × T4; the `cuda:1` tests had only ever been skipped). Now `fit`, the GPU prediction path,
+  `compute_eval`, the binning methods, `fit_bins` and `apply_bins` run with the model device as
+  the current device (`_on_model_device`, the caller's device is restored). The event that
+  guards the host copy of a tree's records is recorded on the model device's stream (it was
+  recorded on the current device's stream, so the records could be read before the copy had
+  finished). CUDA graphs are captured on a side stream per device (`_capture_stream`):
+  `torch.cuda.graph`'s default capture stream is one stream per process, created on the device
+  of the first capture. Checked on two GPUs with `tests/multi_gpu_check.py`.
 * Together with the deterministic histograms (§3.4), models with the same `random_state` fitted
   concurrently in two threads (on one GPU or on two) give forests identical to sequential fits.
 * **`verbose`** constructor parameter (default `True`) gates every `print` in `core.py`. It is

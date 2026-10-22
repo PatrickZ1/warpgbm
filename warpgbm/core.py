@@ -1,3 +1,4 @@
+import functools
 import inspect
 import math
 import threading
@@ -60,6 +61,34 @@ _NODE_WIDTH = 7
 # running in parallel) break PyTorch's caching allocator (see WarpGBM._run_tree)
 _GRAPH_CAPTURE_LOCK = threading.Lock()
 _CAPTURE_MODE = "thread_local"
+# Capture stream per device index. torch.cuda.graph's default capture stream is a single stream
+# for the whole process, created on the device of the first capture: captures of models on other
+# devices would run on it.
+_CAPTURE_STREAMS = {}
+
+
+def _capture_stream():
+    """Side stream for CUDA graph captures on the current device (call with _GRAPH_CAPTURE_LOCK)."""
+    index = torch.cuda.current_device()
+    stream = _CAPTURE_STREAMS.get(index)
+    if stream is None:
+        stream = _CAPTURE_STREAMS[index] = torch.cuda.Stream(index)
+    return stream
+
+
+def _on_model_device(method):
+    """
+    Run a method with the model device as the current CUDA device (the caller's is restored).
+    Kernels and streams that follow the current device (CUDA graph captures, events, PyTorch
+    internals) then match the tensors when device="cuda:N" is not the thread's current device.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with torch.cuda.device(self.device):
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 # Fraction of the free GPU memory (at fit) that the histograms of one tree level may use;
 # above it a level is processed in node chunks without histogram subtraction
@@ -931,6 +960,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
     # ─── Fit ───
 
+    @_on_model_device
     def fit(
         self,
         X,
@@ -1224,6 +1254,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         )
         return False
 
+    @_on_model_device
     def preprocess_gpu_data(self, X_np, era_id_np, reuse_edges=False):
         with torch.no_grad():
             self.num_samples, self.num_features = X_np.shape
@@ -1474,7 +1505,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 sampled = self.feat_indices_tree
                 self.feat_indices_tree = static[2]
                 try:
-                    with _GRAPH_CAPTURE_LOCK, torch.cuda.graph(graph, capture_error_mode=_CAPTURE_MODE):
+                    with _GRAPH_CAPTURE_LOCK, torch.cuda.graph(
+                        graph, stream=_capture_stream(), capture_error_mode=_CAPTURE_MODE
+                    ):
                         outputs = self._grow_tree_device(static[0], static[1])
                 except RuntimeError:
                     # Capture is an optimization only: fall back to eager trees
@@ -1744,8 +1777,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.scores += update
         host = torch.empty(records.shape, dtype=records.dtype, pin_memory=True)
         host.copy_(records, non_blocking=True)
+        # Recorded on the stream of the copy (the model device's, not the caller's current one)
         done = torch.cuda.Event()
-        done.record()
+        done.record(torch.cuda.current_stream(records.device))
         return host, done, grad.shape[1]
 
     def _finish_round(self, i, launched, round_scores):
@@ -1838,6 +1872,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         )[0]
         self._eval_scores = self._base_score_tensor() + self._eval_acc
 
+    @_on_model_device
     def compute_eval(self, i, train_scores=None):
         """Evaluate round i; train_scores are the training scores after round i (default: current)."""
         if self.eval_every_n_trees is None:
@@ -1907,6 +1942,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
     # ─── Binning / prediction ───
 
+    @_on_model_device
     def bin_data_with_existing_edges(self, X_np):
         """Internal int8 bins [N, F] of raw features X_np with the fitted bin edges."""
         if self.bin_edges is None:
@@ -1921,6 +1957,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 f"{name} must have shape (n_samples, {self.num_features}), got {X_np.shape}."
             )
 
+    @_on_model_device
     def bin_inference_data(self, X_np, name="X"):
         """
         Internal int8 bins [N, F] on the model device: raw features are binned with the fitted
@@ -1985,6 +2022,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             return torch.from_numpy(
                 self._predict_raw_staged_cpu(self._bin_inference_cpu(X_np), rounds)
             )
+        return self._staged_raw_gpu(X_np, rounds)
+
+    @_on_model_device
+    def _staged_raw_gpu(self, X_np, rounds):
         bin_indices = self.bin_inference_data(X_np)
         return self._predict_raw_staged_binned(bin_indices, rounds)
 
@@ -2009,6 +2050,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         if not self._is_fitted:
             raise ValueError("Model has not been fitted yet. Call fit() first.")
 
+    @_on_model_device
     def predict_binned(self, bin_indices, num_trees=None):
         """Transformed predictions for binned data ([N] for single-output targets)."""
         pred = self.objective_.transform(self._predict_raw_binned(bin_indices, num_trees))
@@ -2070,6 +2112,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         raw = self._staged_raw(X_np, [num_trees], device)[0]
         return self.objective_.transform(raw).cpu().numpy()
 
+    @_on_model_device
     def predict_proba_binned(self, bin_indices, num_trees=None):
         """
         Predict probabilities from pre-binned data (classification).
