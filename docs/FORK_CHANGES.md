@@ -184,7 +184,11 @@ load (tested).
   recorded on the current device's stream, so the records could be read before the copy had
   finished). CUDA graphs are captured on a side stream per device (`_capture_stream`):
   `torch.cuda.graph`'s default capture stream is one stream per process, created on the device
-  of the first capture. Checked on two GPUs with `tests/multi_gpu_check.py`.
+  of the first capture. Checked on two GPUs (Kaggle 2 × T4, torch 2.11) with
+  `tests/multi_gpu_check.py`. Its diagnosis step (device scope removed, `CUDA_LAUNCH_BLOCKING=1`)
+  located the 2.7.0 fault in PyTorch itself: `torch.ldexp` in `_device_scale` (a `cuda:1`
+  tensor, current device `cuda:0`), before the first tree. Hence the scope on the entry points
+  rather than per-op fixes.
 * Together with the deterministic histograms (§3.4), models with the same `random_state` fitted
   concurrently in two threads (on one GPU or on two) give forests identical to sequential fits.
 * **`verbose`** constructor parameter (default `True`) gates every `print` in `core.py`. It is
