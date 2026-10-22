@@ -700,7 +700,13 @@ Built on the shoulders of PyTorch, scikit-learn, LightGBM, XGBoost, and the CUDA
 
 ## 📝 Version History
 
-### v2.7.1 (Current)
+### v2.8.0 (Current)
+- 🎚️ Warm starts with new hyperparameters: every round keeps the learning rate and depth it was grown with (`round_learning_rates_`, `round_max_depths_`), so changing `learning_rate` or `max_depth` (larger or smaller) on a fitted model only affects the new rounds
+- ✂️ `slice_rounds(start, stop=None)`: a model with only the rounds `[start, stop)` and base score 0, e.g. to keep just the rounds a warm-started copy added (`parent.predict + slice.predict == copy.predict`)
+- ⚡ Vector trees are grown on the outputs that have targets only (`fit(active_outputs=...)` or NaN targets): same trees, 6–11× faster for copies trained on 1–4 of 20 outputs
+- See docs/FORK_CHANGES.md §3.9
+
+### v2.7.1
 - 🩹 Multi-GPU fix: `device="cuda:N"` now works when N is not the thread's current device (2.7.0 died with an illegal memory access on `cuda:1`). The model's device is made current inside `fit`, GPU prediction and binning (`fit_bins` / `apply_bins` too); the tree-copy event and the CUDA-graph capture stream are per device
 
 ### v2.7.0

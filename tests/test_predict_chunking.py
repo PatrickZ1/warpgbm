@@ -56,9 +56,9 @@ def test_flatten_cache_reused_and_invalidated_on_retraining():
     call_counter = {"calls": 0}
     original_pack = model._pack_tree
 
-    def counted_pack(tree, max_nodes, leaf_width):
+    def counted_pack(*args):
         call_counter["calls"] += 1
-        return original_pack(tree, max_nodes, leaf_width)
+        return original_pack(*args)
 
     model._pack_tree = counted_pack
 

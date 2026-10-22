@@ -416,6 +416,67 @@ Held-out scores are identical to 5 decimals. The largest prediction difference f
 * `L2_reg` is the λ in G / (H + λ). With the squared-error hessian of 1 per row it matters once λ
   approaches the number of rows per leaf.
 
+### 3.9 Warm starts with new hyperparameters, round slicing, inactive outputs (v2.8.0)
+
+Driven by the hedge chain: one K = 20 multi-output model is deep-copied per structure / per output,
+and each copy continues training on a subset of the outputs (the other targets NaN) with its own
+learning rate, depth and regularization.
+
+**Per-round learning rate and depth.** v2.7 stored the leaves unscaled and multiplied them by the
+*current* `learning_rate` when packing; the pack layout and the CPU traversal used the *current*
+`max_depth`. Changing either on a fitted model rescaled, or (smaller depth) broke, the existing
+trees, both in `predict` and in the initial scores of a warm start. Now:
+
+* `round_learning_rates_` / `round_max_depths_` (lists, one entry per trained round) record what
+  each round was grown with. Packing scales every round by its own rate. The layout uses
+  `M = 2^(D + 1)` for the deepest round, and the CPU traversal runs D + 1 levels.
+* Changing `learning_rate`, `max_depth` (larger or smaller), `min_child_weight`, `min_split_gain`,
+  `min_sum_hessian`, `L2_reg`, `colsample_bytree` or `n_estimators` (= total rounds) on a fitted
+  model before a warm-start `fit` affects only the new rounds. The inherited rounds predict
+  bit-identically. Nothing else was captured across fits: CUDA graphs and kernel scalars are
+  per fit. `fit` now re-validates these attributes (for example `learning_rate = 0` raises) and
+  accepts numpy scalars.
+* `truncate`, `save_model` / `load_model`, deepcopy and pickle keep both lists. Files and pickles
+  from v2.7 and older get `[learning_rate] * n` and the depths of the stored trees.
+
+**`slice_rounds(start, stop=None)`** returns a new, independent fitted model with only the
+rounds `[start, stop)` (deep copies of those rounds only) and base score 0. Its predictions are the
+contributions of those rounds, so
+`parent.predict(X) + copy.slice_rounds(parent.num_trees_).predict(X) ≈ copy.predict(X)`
+(float tolerance; GPU and CPU, raw and pre-binned). `stop=None` is the default model
+(`best_iteration_` after early stopping). The slice keeps the bin edges, `prebinned_`, the
+objective and the per-round rates / depths. Its feature importance covers its own rounds.
+Per-era importance and eval histories are dropped, and it cannot be warm-started (raises). For
+classifiers use `predict_raw` on slices. Hedge use: replace each trained copy by its slice. Each
+copy then holds only its own rounds instead of all the inherited ones (about 3.7× less memory and
+CPU prediction time per chain). A fitted model also no longer keeps the `[N]` era index tensor of
+its training set.
+
+**Inactive outputs.** Vector trees (`multi_regression`, vector custom objectives) are grown on the
+outputs that have a positive-weight target only. The others have g = h = 0 in every row: they fail
+the `min_sum_hessian` gate of every split, so they change neither gains nor era directions.
+The fixed-point scales are maxima, so they are unchanged too. The stored trees keep K leaf values,
+0 at the inactive outputs, so the format and the predict kernels are unchanged.
+`fit(..., active_outputs=[...])` (indices or a `[K]` bool mask) additionally treats the other
+outputs as missing in the training and eval sets.
+
+* The trees are bit-identical to v2.7.1 with `deterministic=True` (checked for fresh fits and warm
+  starts with NaN outputs). With `deterministic=False` they differ by float-atomic noise (≤ 1e-6).
+  Exceptions where v2.8 differs on purpose: `min_sum_hessian = 0` (v2.7 let inactive outputs vote −1
+  in the split direction) and `L2_reg = 0` (v2.7 gave NaN leaves 0 / 0 there, now 0).
+* Per-output (softmax) forests are unchanged.
+* `min_child_weight` still compares against the row weight **averaged over all K outputs** (the
+  count channel), as in v2.7. With 1 of 20 outputs active a row counts 1/20, so `min_child_weight=50`
+  means about 1000 rows per child and era. Scale it per level if needed.
+
+Benchmark (`benchmarks/bench_inactive_outputs.py`, GTX 1660 Ti, 12k rows × 1000 features, depth 4,
+64 bins, 8 eras, colsample 0.4, K = 20, warm start of a 100-round parent):
+
+| copy | v2.7.1 | v2.8.0 | speed-up |
+|---|---|---|---|
+| structure copy, 4 of 20 outputs, 500 rounds | 23.9 s (47.7 ms/round) | 3.7 s (7.5 ms/round) | 6.4× |
+| output copy, 1 of 20 outputs, 300 rounds | 7.5 s (25.1 ms/round) | 0.68 s (2.3 ms/round) | 11× |
+
 ---
 
 ## 4. Behaviour changes to be aware of
@@ -443,6 +504,10 @@ Held-out scores are identical to 5 decimals. The largest prediction difference f
 | `threads_per_block`, `rows_per_thread` (v2.7.0) | constructor parameters (histogram launch configuration) | removed; passing them raises `TypeError` |
 | internal API (v2.7.0) | `compute_histograms`, `find_best_split`, `grow_tree`, `_get_cached_tree_tensors`, `_accumulate_tree_tensors`, CUDA `compute_histogram3` / `compute_split` / `predict_forest` | replaced by the level-wise engine (`_grow_tree_device`) and the packed forest (`_packed_forest`); CUDA `histogram_level`, `node_sums`, `sibling_subtract`, `level_split`, `select_split`, `predict_forest` (new signature). `flatten_tree` is kept but unused |
 | end of `fit` (v2.7.0) | `gc.collect()` | removed (cost about 55 ms per fit) |
+| `learning_rate` / `max_depth` changed on a fitted model (v2.8.0) | rescaled / broke the existing trees in `predict` and in warm starts | only new rounds use them; each round keeps its rate and depth (`round_learning_rates_`, `round_max_depths_`) |
+| hyperparameter checks (v2.8.0) | constructor only | also at every `fit` (attributes changed on a fitted model are checked); numpy scalars accepted |
+| outputs without targets (v2.8.0) | trees grown on all K outputs | grown on the active outputs only (same trees in deterministic mode, see §3.9); `L2_reg = 0` now gives leaf 0 instead of NaN there |
+| `era_indices` after `fit` (v2.8.0) | kept the `[N]` training era tensor | released |
 
 ---
 
@@ -485,6 +550,19 @@ pyenv), installed with `pip install --no-build-isolation`.
   The histogram-kernel test now covers both modes, two segments and the unit-hessian layout. A
   4-thread stress test (repeated deterministic and fast fits on one GPU) matched sequential
   forests.
+
+* **v2.8.0:** 198 tests pass and 5 skip (single GPU here), against the in-place build. 31 tests are
+  new in `tests/test_round_slicing.py`:
+  * warm starts with a new lr / depth ±2 / colsample / min_child_weight / L2 on a row subset with
+    NaN outputs (raw and pre-binned): the inherited rounds are bit-identical on GPU and CPU, and the
+    NaN outputs are unchanged;
+  * the two-rate equivalence and the packed leaves = leaf × round rate;
+  * `slice_rounds` predictions, memory, independence and rollback default;
+  * save/load, v2.7 files and pickles, truncate followed by a new lr;
+  * re-validation at fit;
+  * inactive-output trees identical to the all-K path, and `active_outputs=`.
+
+  Cross-version check against v2.7.1: identical predictions in deterministic mode.
 
 ## 6. Known limitations
 

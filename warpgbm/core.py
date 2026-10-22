@@ -1,3 +1,4 @@
+import copy
 import functools
 import inspect
 import math
@@ -99,6 +100,13 @@ _MULTI_OUTPUT_METRICS = ["mse", "loss"]
 _CLASSIFICATION_METRICS = ["logloss", "accuracy", "loss"]
 _HIGHER_IS_BETTER = ("accuracy", "corr")
 _RECORD_TRAINING_LOSS = ("eval", "all", "none")
+# Constructor arguments checked by _validate_hyperparams (again at every fit: they may be changed
+# on a fitted model before a warm start)
+_VALIDATED_HYPERPARAMS = (
+    "objective", "num_bins", "max_depth", "learning_rate", "n_estimators", "min_child_weight",
+    "min_split_gain", "L2_reg", "device", "colsample_bytree", "monotonic_constraints",
+    "min_sum_hessian", "prebinned", "record_training_loss", "deterministic",
+)
 
 
 class WarpGBM(BaseEstimator, RegressorMixin):
@@ -121,6 +129,15 @@ class WarpGBM(BaseEstimator, RegressorMixin):
     _tree_graphs = {}
     # Replay trees as CUDA graphs (see _run_tree); False runs every tree eagerly
     _use_cuda_graphs = True
+    # Grow vector trees on the outputs with targets only (see fit); False uses all K outputs
+    _skip_inactive_outputs = True
+    # Learning rate and max_depth of every boosting round (None: pickled by v2.7, see
+    # _ensure_round_meta)
+    round_learning_rates_ = None
+    round_max_depths_ = None
+    # Model of a slice of boosting rounds without a base score (see slice_rounds)
+    _is_slice = False
+    _active_cols = None
 
     def __init__(
         self,
@@ -207,6 +224,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._targets_1d = True
         self._is_fitted = False
         self._trees_trained = 0  # Track number of trees already trained
+        self.round_learning_rates_ = []
+        self.round_max_depths_ = []
         self._invalidate_prediction_cache()
         self._objective_source = None
         self._reset_eval_state()
@@ -253,14 +272,15 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         ]
 
         for param in int_params:
-            if not isinstance(kwargs[param], int):
+            value = kwargs[param]
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
                 raise TypeError(
                     f"{param} must be an integer, got {type(kwargs[param])}."
                 )
 
         for param in float_params:
             if not isinstance(
-                kwargs[param], (float, int)
+                kwargs[param], (float, int, np.floating, np.integer)
             ):  # Accept ints as valid floats
                 raise TypeError(f"{param} must be a float, got {type(kwargs[param])}.")
 
@@ -724,11 +744,13 @@ class WarpGBM(BaseEstimator, RegressorMixin):
     #
     # Every boosting round is flattened once into numpy arrays (see warpgbm/cuda/predict.cu):
     #   nodes [t, M, 4] int32: feature (-1 = leaf), split_bin | nan_left << 8, left, right
-    #   leaf  [t, M, Lw] float32: leaf values times the learning rate (Lw = K for vector trees)
+    #   leaf  [t, M, Lw] float32: leaf values times the round's learning rate (Lw = K for vector trees)
     #   out_col [t] int32: score column of each tree (per-output forests only)
-    # where t is the number of trees of the round. Rounds are packed lazily and kept until the
-    # forest changes (fresh fit, truncate, load); the first n rounds are a prefix of the
-    # concatenation, so any num_trees is a slice and never re-flattens.
+    # where t is the number of trees of the round and M = 2^(D + 1) for the deepest round D (see
+    # round_max_depths_). Rounds are packed lazily and kept until the forest changes (fresh fit,
+    # truncate, load, a deeper round); the first n rounds are a prefix of the concatenation, so
+    # any num_trees is a slice and never re-flattens. Every round keeps the learning rate it was
+    # grown with (round_learning_rates_): changing learning_rate only affects later rounds.
 
     def _invalidate_prediction_cache(self, keep_rounds=0):
         """Drop packed rounds from keep_rounds on, and all concatenations."""
@@ -743,13 +765,43 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self._base_cpu = None
             self._base_gpu = None
 
+    @staticmethod
+    def _tree_depth(tree):
+        """Depth of a tree dict (0 for a single leaf or an empty tree)."""
+        depth = 0
+        stack = [(tree, 0)] if tree else []
+        while stack:
+            node, d = stack.pop()
+            if "leaf_value" in node:
+                depth = max(depth, d)
+            else:
+                stack.extend(((node["left"], d + 1), (node["right"], d + 1)))
+        return depth
+
+    def _ensure_round_meta(self):
+        """
+        Fill round_learning_rates_ / round_max_depths_ of models from v2.7 and older: the current
+        learning rate (the only one known) and the depth of the stored trees.
+        """
+        n = self._trees_trained
+        if self.round_learning_rates_ is None:
+            self.round_learning_rates_ = [float(self.learning_rate)] * n
+        if self.round_max_depths_ is None:
+            depths = []
+            for round_trees in (self.forest or [])[:n]:
+                trees = round_trees if isinstance(round_trees, list) else [round_trees]
+                depths.append(max([self._tree_depth(t) for t in trees], default=0))
+            self.round_max_depths_ = depths
+
     def _pack_layout(self):
         """(max nodes per tree, leaf width, per-output) of the packed forest."""
+        self._ensure_round_meta()
         per_output = self._output_strategy() == PER_OUTPUT
         leaf_width = 1 if per_output else self.num_outputs
-        return 2 ** (self.max_depth + 1), leaf_width, per_output
+        depth = max(self.round_max_depths_, default=self.max_depth)
+        return 2 ** (depth + 1), leaf_width, per_output
 
-    def _pack_tree(self, tree, max_nodes, leaf_width):
+    def _pack_tree(self, tree, max_nodes, leaf_width, learning_rate):
         """Flatten one tree dict (pre-order node ids) into (nodes [M, 4], leaf [M, Lw])."""
         nodes = np.zeros((max_nodes, 4), dtype=np.int32)
         nodes[:, 0] = -1
@@ -776,14 +828,14 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 # Right is pushed first so that the left subtree gets the next ids
                 stack.append((node["right"], i, 3))
                 stack.append((node["left"], i, 2))
-        leaf *= np.float32(self.learning_rate)
+        leaf *= np.float32(learning_rate)
         return nodes, leaf
 
-    def _pack_round(self, round_trees):
+    def _pack_round(self, round_trees, learning_rate):
         max_nodes, leaf_width, per_output = self._pack_layout()
         trees = round_trees if per_output else [round_trees]
         packed = [
-            (self._pack_tree(tree, max_nodes, leaf_width), k)
+            (self._pack_tree(tree, max_nodes, leaf_width, learning_rate), k)
             for k, tree in enumerate(trees)
             if tree
         ]
@@ -795,12 +847,14 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         return nodes, leaf, out_col
 
     def _ensure_packed(self, num_rounds):
-        key = (float(self.learning_rate), self.max_depth, self.num_outputs, self._output_strategy())
+        # The learning rates are fixed per round; the layout changes with the deepest round
+        key = (self._pack_layout()[0], self.num_outputs, self._output_strategy())
         if self._pack_key != key:
             self._invalidate_prediction_cache()
             self._pack_key = key
+        rates = self.round_learning_rates_
         for r in range(len(self._pack_rounds), num_rounds):
-            self._pack_rounds.append(self._pack_round(self.forest[r]))
+            self._pack_rounds.append(self._pack_round(self.forest[r], rates[r]))
 
     def _packed_forest(self, num_rounds, device=None):
         """
@@ -912,12 +966,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 leaf.reshape(T * M, leaf.shape[2]),
             )
             self._flat_cpu = flat
-        return flat[1:] + (out_col, round_end)
+        return flat[1:] + (out_col, round_end, nodes.shape[1])
 
     def _predict_raw_staged_cpu(self, bins, rounds):
         """CPU version of _predict_raw_staged_binned for internal bins [N, F] (numpy int8)."""
-        feature, split_bin, nan_left, left, right, leaf, out_col, round_end = self._flat_forest_cpu(
-            max(rounds)
+        feature, split_bin, nan_left, left, right, leaf, out_col, round_end, M = (
+            self._flat_forest_cpu(max(rounds))
         )
         tree_counts = [int(round_end[r - 1]) if r > 0 else 0 for r in rounds]
         base = self._base_score_np()
@@ -927,7 +981,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         if T == 0 or n == 0:
             out[:] = base
             return out
-        M = 2 ** (self.max_depth + 1)
         roots = np.arange(T, dtype=np.int64) * M
         F = bins.shape[1]
         # Bound the [rows, T, K] intermediate arrays
@@ -938,7 +991,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             flat_bins = b.reshape(-1).astype(np.int64)
             row_offset = (np.arange(rows, dtype=np.int64) * F)[:, None]
             node = np.broadcast_to(roots, (rows, T)).copy()
-            for _ in range(self.max_depth + 1):
+            # M = 2^(D + 1): D + 1 levels for the deepest tree
+            for _ in range(M.bit_length() - 1):
                 f = feature[node]
                 is_leaf = f < 0
                 if is_leaf.all():
@@ -975,7 +1029,27 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         eval_metric=None,
         eval_aux=None,
         train_aux=None,
+        active_outputs=None,
     ):
+        """
+        Fit the model (continue training with warm_start=True on a fitted model).
+
+        Hyperparameters may be changed on a fitted model before a warm start (learning_rate,
+        max_depth, regularization, colsample_bytree, n_estimators = total rounds): they apply to
+        the new rounds only. Every round keeps the learning rate and depth it was grown with
+        (round_learning_rates_, round_max_depths_).
+
+        active_outputs: optional output indices or a [K] bool mask (vector objectives such as
+        multi_regression). The other outputs are treated as missing targets in the training and
+        eval sets: their leaf values are 0. Outputs without any positive-weight target are
+        detected and skipped automatically; trees are grown on the active outputs only.
+        """
+        self._validate_hyperparams(**{name: getattr(self, name) for name in _VALIDATED_HYPERPARAMS})
+        if self.warm_start and self._is_fitted and self._is_slice:
+            raise ValueError(
+                "A model from slice_rounds() has no base score and cannot continue training "
+                "(warm_start=True); warm-start the model it was sliced from instead."
+            )
         self.objective_ = self._resolve_objective()
         has_eval_set = X_eval is not None and y_eval is not None
         # Roll back to the best evaluated round only when early stopping was requested
@@ -1016,6 +1090,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             # Fresh start: reset training state
             self._is_fitted = False
             self._trees_trained = 0
+            self.round_learning_rates_ = []
+            self.round_max_depths_ = []
+            self._is_slice = False
             self.training_loss = []
             self._reset_eval_state()
             self._per_era_importance_all = None
@@ -1026,6 +1103,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 raise ValueError(
                     f"X has {X.shape[1]} features, but model was trained with {self.num_features} features."
                 )
+            self._ensure_round_meta()
             if self._trees_trained >= self.n_estimators:
                 # Already have all requested trees
                 if self.verbose:
@@ -1055,6 +1133,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             )
         self.num_outputs = n_outputs
         self._targets_1d = y.ndim == 1
+        keep = self._active_output_mask(active_outputs, y_prepared.shape[1])
 
         if not continuing:
             self.forest = (
@@ -1077,6 +1156,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._ones_i64 = torch.ones(self.num_samples, dtype=torch.int64, device=self.device)
 
         self.Y_gpu, self.tw = self._build_targets(y_prepared, sample_weight)
+        if keep is not None:
+            self.tw = self._mask_outputs(self.tw, keep)
+        self._active_cols = self._find_active_outputs()
         # If every hessian equals the row weight (squared error without missing targets and with
         # the same weight for all outputs), the hessian sums are read from the row-weight
         # histogram instead of being accumulated (K + 1 instead of 2K + 1 channels)
@@ -1127,6 +1209,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.Y_gpu_eval, self.tw_eval = self._build_targets(
                 y_eval_prepared, sample_weight_eval
             )
+            if keep is not None:
+                self.tw_eval = self._mask_outputs(self.tw_eval, keep)
             self.eval_every_n_trees = eval_every_n_trees
             self.early_stopping_rounds = early_stopping_rounds
             self.eval_metric = self._resolve_eval_metric(eval_metric)
@@ -1162,6 +1246,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         # Release training buffers
         self.bin_indices = None
         self.bins_fm = None
+        self.era_indices = None
         self._row_ids = None
         self._ones_i64 = None
         self._tree_graphs = {}
@@ -1177,9 +1262,60 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._eval_aux = None
         self._train_aux = None
         self._best_train_scores = None
+        self._active_cols = None
         self._rng = None
 
         return self
+
+    def _active_output_mask(self, active_outputs, num_targets):
+        """fit's active_outputs as a [K] bool tensor on the device (None: all outputs)."""
+        if active_outputs is None:
+            return None
+        K = self.num_outputs
+        if self._output_strategy() == PER_OUTPUT or num_targets != K:
+            raise ValueError(
+                "active_outputs is only supported for vector objectives with one target per "
+                "output (e.g. multi_regression)."
+            )
+        sel = np.asarray(active_outputs)
+        if sel.dtype == bool:
+            if sel.shape != (K,):
+                raise ValueError(f"active_outputs mask must have shape ({K},), got {sel.shape}.")
+            keep = sel
+        else:
+            if sel.ndim != 1 or not np.issubdtype(sel.dtype, np.integer):
+                raise TypeError("active_outputs must be a sequence of output indices or a bool mask.")
+            if sel.size and (sel.min() < 0 or sel.max() >= K):
+                raise ValueError(f"active_outputs indices must lie in [0, {K - 1}].")
+            keep = np.zeros(K, dtype=bool)
+            keep[sel] = True
+        return torch.from_numpy(keep).to(self.device)
+
+    def _mask_outputs(self, tw, keep):
+        """Target weights with the outputs outside keep [K] treated as missing."""
+        zero = torch.zeros((), device=self.device)
+        return _TargetWeights(
+            weight=torch.where(keep, tw.weight, zero).contiguous(),
+            mask=(tw.mask & keep).contiguous(),
+            target_mask=(tw.target_mask & keep).contiguous(),
+        )
+
+    def _find_active_outputs(self):
+        """
+        Score columns with a positive-weight target, as (device index tensor, host list), or None
+        when vector trees are grown on all K outputs. The other columns have g = h = 0 in every
+        row: they fail the min_sum_hessian gate of every split, so they change neither gains nor
+        directions, and their leaf values are 0. Growing the trees on the active columns only
+        gives the same trees (bit-identical with deterministic=True when min_sum_hessian > 0).
+        """
+        K = self.num_outputs
+        if not self._skip_inactive_outputs or self._output_strategy() == PER_OUTPUT or K < 2:
+            return None
+        cols = torch.nonzero((self.tw.weight > 0).any(dim=0)).flatten()
+        n_active = cols.numel()  # host sync, once per fit
+        if n_active == 0 or n_active == K:
+            return None
+        return cols, cols.tolist()
 
     def _prepare_targets(self, y, y_eval, continuing):
         """Encode class labels (classifiers) and convert targets to [N, T] float32."""
@@ -1633,11 +1769,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         records.append(finite.double().view(1))
         return update, torch.cat(records)
 
-    def _tree_from_records(self, host, Kc):
+    def _tree_from_records(self, host, Kc, cols=None):
         """
         Tree dict from the records of _grow_tree_device: per level d, [2^d, 6 + E + Kc] rows
         (active, valid split, feature, candidate, gain, rows, per-era gains, node values),
-        then the finiteness flag of the gradients.
+        then the finiteness flag of the gradients. cols: the K score columns of the Kc node
+        values (the leaves of the other outputs are 0), None for all.
         """
         if not host[-1]:
             raise FloatingPointError(
@@ -1666,10 +1803,13 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 node["gain"] = float(r[4])
                 return node
             value = r[6 + E :]
-            return {
-                "leaf_value": float(value[0]) if Kc == 1 else [float(v) for v in value],
-                "samples": int(r[5]),
-            }
+            if cols is not None:
+                leaf_value = [0.0] * self.num_outputs
+                for c, v in zip(cols, value):
+                    leaf_value[c] = float(v)
+            else:
+                leaf_value = float(value[0]) if Kc == 1 else [float(v) for v in value]
+            return {"leaf_value": leaf_value, "samples": int(r[5])}
 
         return build(0, 0)
 
@@ -1739,7 +1879,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                     for col in range(self.num_outputs)
                 ]
             else:
-                launched = [self._launch_tree(neg_grad, h)]
+                cols = self._active_cols
+                if cols is not None:
+                    # Outputs without targets have g = h = 0: grow the tree on the others
+                    neg_grad = neg_grad[:, cols[0]].contiguous()
+                    h = h[:, cols[0]].contiguous()
+                launched = [self._launch_tree(neg_grad, h, cols=cols)]
             # Training scores after round i, for its evaluation (self.scores moves on)
             round_scores = self.scores.clone() if self.eval_every_n_trees is not None else None
 
@@ -1768,11 +1913,16 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             else:
                 print(f"Finished training {self.objective_.name} forest. Total trees: {self._trees_trained}")
 
-    def _launch_tree(self, grad, hess, score_col=None):
-        """Enqueue one tree: updates the training scores, starts the copy of its records."""
+    def _launch_tree(self, grad, hess, score_col=None, cols=None):
+        """
+        Enqueue one tree: updates the training scores, starts the copy of its records. cols:
+        score columns of a vector tree grown on a subset of the outputs (see _find_active_outputs).
+        """
         update, records = self._run_tree(grad, hess)
         if score_col is not None:
             self.scores[:, score_col] += update[:, 0]
+        elif cols is not None:
+            self.scores[:, cols[0]] += update
         else:
             self.scores += update
         host = torch.empty(records.shape, dtype=records.dtype, pin_memory=True)
@@ -1780,18 +1930,20 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         # Recorded on the stream of the copy (the model device's, not the caller's current one)
         done = torch.cuda.Event()
         done.record(torch.cuda.current_stream(records.device))
-        return host, done, grad.shape[1]
+        return host, done, grad.shape[1], None if cols is None else cols[1]
 
     def _finish_round(self, i, launched, round_scores):
         """Turn the records of round i into tree dicts, store and evaluate the round."""
         trees = []
-        for host, done, Kc in launched:
+        for host, done, Kc, cols in launched:
             done.synchronize()
-            trees.append(self._tree_from_records(host.numpy(), Kc))
+            trees.append(self._tree_from_records(host.numpy(), Kc, cols))
         if self._output_strategy() == PER_OUTPUT:
             self.forest.append(trees)
         else:
             self.forest[i] = trees[0]
+        self.round_learning_rates_.append(float(self.learning_rate))
+        self.round_max_depths_.append(int(self.max_depth))
         self._trees_trained = i + 1
         self.compute_eval(i, round_scores)
 
@@ -2315,6 +2467,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             num_trees = self.best_iteration_
         n = self._resolve_num_trees(num_trees)
         default_before = self._default_num_trees()
+        self._ensure_round_meta()
 
         era_importance = self._snapshot_importance(n)
         if era_importance is None and self._per_era_importance_all is not None \
@@ -2328,6 +2481,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             for r in range(n, len(self.forest)):
                 self.forest[r] = {}
         self._trees_trained = n
+        del self.round_learning_rates_[n:]
+        del self.round_max_depths_[n:]
         self._rollback = False
         if self.best_iteration_ is not None and self.best_iteration_ > n:
             self.best_iteration_ = None
@@ -2340,6 +2495,75 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.feature_importance_ = self._total_importance(n)
         self.per_era_feature_importance_ = era_importance
         return self
+
+    # Fields slice_rounds() does not copy from the source model (set explicitly or left empty)
+    _SLICE_SKIP = (
+        "forest", "base_prediction", "round_learning_rates_", "round_max_depths_",
+        "train_predictions_", "training_loss", "evals_result_", "eval_loss", "eval_iterations_",
+        "feature_importance_", "per_era_feature_importance_", "_per_era_importance_all",
+        "_per_era_importance_best", "_pack_rounds", "_pack_concat", "_pack_device", "_pack_key",
+        "_edges_cpu", "_base_cpu", "_base_gpu", "_flat_cpu", "_tree_graphs", "era_indices",
+    )
+
+    def slice_rounds(self, start, stop=None):
+        """
+        A new, independent fitted model holding only the boosting rounds [start, stop), without a
+        base score: its raw predictions are the sum of those rounds' contributions, so
+
+            model.predict_raw(X, num_trees=start) + model.slice_rounds(start).predict_raw(X)
+                == model.predict_raw(X)   (float tolerance)
+
+        stop: None uses the default model (best_iteration_ after early stopping, else all trained
+        rounds). Only the rounds of the slice are copied (memory and prediction time are
+        proportional to stop - start); bin edges, objective and per-round learning rates / depths
+        are kept. The slice cannot continue training (warm_start=True raises); its feature
+        importance covers its own rounds, per-era importance and eval histories are dropped.
+        Classifier slices are meant for predict_raw (labels / probabilities of a partial sum of
+        rounds have no meaning on their own).
+        """
+        self._check_fitted()
+        if stop is None:
+            stop = self._default_num_trees()
+        for name, value in (("start", start), ("stop", stop)):
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise TypeError(f"{name} must be an int, got {value!r}.")
+        start, stop = int(start), int(stop)
+        if not 0 <= start <= stop <= self._trees_trained:
+            raise ValueError(
+                f"slice_rounds needs 0 <= start <= stop <= {self._trees_trained}, "
+                f"got start={start}, stop={stop}."
+            )
+        self._ensure_round_meta()
+        n = stop - start
+
+        state = {k: v for k, v in self.__dict__.items() if k not in self._SLICE_SKIP}
+        part = self.__class__.__new__(self.__class__)
+        # One deepcopy call: objects shared by several fields (objective / _objective_source)
+        # stay shared in the copy
+        part.__dict__.update(copy.deepcopy(state))
+        part.forest = copy.deepcopy(self.forest[start:stop])
+        part.round_learning_rates_ = list(self.round_learning_rates_[start:stop])
+        part.round_max_depths_ = list(self.round_max_depths_[start:stop])
+        part._trees_trained = n
+        part.n_estimators = max(n, 1)
+        part._is_slice = True
+        part.warm_start = False
+        part.train_predictions_ = None
+        part.training_loss = []
+        part._reset_eval_state()
+        part._per_era_importance_all = None
+        part._per_era_importance_best = None
+        part._tree_graphs = {}
+        part._invalidate_prediction_cache()
+        zero = torch.zeros(self.num_outputs, dtype=torch.float32, device=self.device)
+        part._store_base_score(zero)
+        try:
+            part.feature_importance_ = part._total_importance(n)
+        except ValueError:
+            # Trees saved without per-split gains
+            part.feature_importance_ = None
+        part.per_era_feature_importance_ = None
+        return part
 
     # ─── Persistence ───
 
@@ -2365,6 +2589,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         """
         if not self._is_fitted:
             raise ValueError("Cannot save unfitted model. Call fit() first.")
+        self._ensure_round_meta()
 
         def to_cpu(value):
             return value.detach().cpu() if torch.is_tensor(value) else value
@@ -2404,6 +2629,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             "per_era_feature_importance_": self.per_era_feature_importance_,
             "_is_fitted": self._is_fitted,
             "_trees_trained": self._trees_trained,
+            "round_learning_rates_": list(self.round_learning_rates_),
+            "round_max_depths_": list(self.round_max_depths_),
+            "_is_slice": self._is_slice,
             "training_loss": (
                 self.training_loss if hasattr(self, "training_loss") else []
             ),
@@ -2503,6 +2731,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         self._is_fitted = state['_is_fitted']
         self._trees_trained = state['_trees_trained']
+        # Models saved by v2.7 and older: filled by _ensure_round_meta
+        self.round_learning_rates_ = state.get("round_learning_rates_")
+        self.round_max_depths_ = state.get("round_max_depths_")
+        self._is_slice = state.get("_is_slice", False)
         self._objective_source = self.objective
         self.training_loss = state.get('training_loss', [])
         # Models saved before best-iteration tracking: all trees, no best round
@@ -2536,6 +2768,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         self.monotonic_required_split_direction_gpu_ = None
         self._invalidate_prediction_cache()
+        self._ensure_round_meta()
 
         if self.verbose:
             print(f"Model loaded from {path} ({self._trees_trained} trees)")
