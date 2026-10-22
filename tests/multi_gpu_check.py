@@ -7,8 +7,6 @@ Multi-GPU check (needs 2 GPUs, e.g. Kaggle T4 x2). Run from the repository root 
 1. pytest tests/test_multi_gpu.py (the cuda:1 tests are skipped on one GPU)
 2. the 2.7.0 failure case: prebinned multi_regression fitted on cuda:1 from a thread whose
    current device is cuda:0; cuda:1 == cuda:0 (bit-identical), concurrent == sequential
-3. diagnosis: the same case without the device scope of the public methods, with
-   CUDA_LAUNCH_BLOCKING=1, in a subprocess (it may crash), to localise the original fault
 """
 import os
 import subprocess
@@ -82,21 +80,7 @@ def check():
     assert torch.cuda.current_device() == 0
 
 
-def diagnose():
-    """The failure case with the device scope removed (child process, CUDA_LAUNCH_BLOCKING=1)"""
-    for name, value in list(vars(WarpGBM).items()):
-        if callable(value) and not isinstance(value, staticmethod) and hasattr(value, "__wrapped__"):
-            setattr(WarpGBM, name, value.__wrapped__)
-    X, Y = data()
-    in_threads([(fit, ("cuda:1", X, Y))])
-    print("  without the device scope: fit on cuda:1 OK -> the event / capture-stream fixes suffice")
-
-
 if __name__ == "__main__":
-    if sys.argv[1:] == ["diagnose"]:
-        diagnose()
-        sys.exit(0)
-
     print(f"torch {torch.__version__}, {torch.cuda.device_count()} GPUs:",
           [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])
     assert torch.cuda.device_count() >= 2, "needs two GPUs"
@@ -113,11 +97,5 @@ if __name__ == "__main__":
         traceback.print_exc()
         ok = False
 
-    print("\n[3] diagnosis: without device scope, CUDA_LAUNCH_BLOCKING=1", flush=True)
-    env = dict(os.environ, CUDA_LAUNCH_BLOCKING="1")
-    diag = subprocess.run([sys.executable, __file__, "diagnose"], env=env,
-                          capture_output=True, text=True)
-    print(diag.stdout[-3000:], diag.stderr[-6000:], f"  exit code {diag.returncode}", sep="\n")
-
-    print("\nSUMMARY: pytest", "OK" if rc == 0 else "FAILED", "| failure case", "OK" if ok else "FAILED",
-          "| diagnosis exit code", diag.returncode)
+    print("\nSUMMARY: pytest", "OK" if rc == 0 else "FAILED", "| failure case", "OK" if ok else "FAILED")
+    sys.exit(0 if rc == 0 and ok else 1)

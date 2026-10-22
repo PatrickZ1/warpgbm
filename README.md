@@ -700,7 +700,10 @@ Built on the shoulders of PyTorch, scikit-learn, LightGBM, XGBoost, and the CUDA
 
 ## 📝 Version History
 
-### v2.7.0 (Current)
+### v2.7.1 (Current)
+- 🩹 Multi-GPU fix: `device="cuda:N"` now works when N is not the thread's current device (2.7.0 died with an illegal memory access on `cuda:1`). The model's device is made current inside `fit`, GPU prediction and binning (`fit_bins` / `apply_bins` too); the tree-copy event and the CUDA-graph capture stream are per device
+
+### v2.7.0
 - 🚀 Level-wise tree growth without host syncs, replayed as a CUDA graph per tree, pipelined rounds; rewritten histogram (feature-major bins, all outputs per block, feature groups), split and prediction kernels. Small, wide data trains 5–15× faster
 - 🎛️ `deterministic` (default `True`): `False` uses float histograms for a further 10–30 % at the cost of bit-reproducibility
 - 🪜 `staged_predict` / `staged_predict_raw` / `staged_predict_proba`: predictions after several round counts from one pass
