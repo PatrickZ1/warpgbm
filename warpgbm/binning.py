@@ -94,7 +94,8 @@ def fit_bins(X, num_bins, device="cuda"):
     """
     _check_num_bins(num_bins)
     _check_device(device)
-    with torch.no_grad():
+    # The device is also the current one, as in WarpGBM's methods (see core._on_model_device)
+    with torch.no_grad(), torch.cuda.device(device):
         X_t = _to_float_gpu(X, device)
         if X_t.shape[0] == 0:
             raise ValueError("X must contain at least one row.")
@@ -125,7 +126,7 @@ def apply_bins(X, edges, device=None):
     if device is None:
         device = edges.device if torch.is_tensor(edges) and edges.is_cuda else "cuda"
     _check_device(device)
-    with torch.no_grad():
+    with torch.no_grad(), torch.cuda.device(device):
         edges_t = torch.as_tensor(edges, dtype=torch.float32).to(device).contiguous()
         if edges_t.ndim != 2:
             raise ValueError(f"edges must be 2-dimensional, got shape {tuple(edges_t.shape)}.")
