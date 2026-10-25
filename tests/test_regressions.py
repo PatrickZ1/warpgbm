@@ -237,6 +237,8 @@ def _to_legacy_state(state):
     legacy = copy.deepcopy(state)
     for key in ("objective_", "min_sum_hessian", "_targets_1d", "num_outputs"):
         legacy.pop(key, None)
+    # Trees were stored as nested dicts (v2.9 stores blocks of arrays)
+    legacy["forest"] = legacy.pop("forest_blocks")
 
     def convert(node):
         if "leaf_value" in node:
@@ -268,6 +270,7 @@ def test_models_saved_in_the_legacy_format_still_load(objective, tmp_path):
     model.save_model(str(path))
     with open(path, "rb") as f:
         state = pickle.load(f)
+    state["forest_blocks"] = list(model.forest)
     legacy = _to_legacy_state(state)
     if objective == "multiclass":
         legacy["base_prediction"] = None  # the old multiclass code did not store its prior

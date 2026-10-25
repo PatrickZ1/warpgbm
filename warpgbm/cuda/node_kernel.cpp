@@ -36,8 +36,10 @@ void launch_bin_matrix_kernel(
 
 void predict_with_forest(
     const at::Tensor &bins, int64_t row_stride, int64_t feat_stride, int64_t num_rows,
-    const at::Tensor &nodes, const at::Tensor &leaf, const c10::optional<at::Tensor> &out_col,
-    const at::Tensor &base, int nan_bin, const at::Tensor &ckpt, at::Tensor &out);
+    const at::Tensor &nodes, const at::Tensor &values, const at::Tensor &meta, const at::Tensor &lr,
+    const c10::optional<at::Tensor> &cols, int64_t K, const c10::optional<at::Tensor> &init,
+    const at::Tensor &base, int nan_bin, const at::Tensor &ckpt,
+    const c10::optional<at::Tensor> &out, const c10::optional<at::Tensor> &acc_out);
 
 // Bindings
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
@@ -48,5 +50,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("level_split", &launch_level_split, "Split candidates of the nodes of a tree level (CUDA)");
     m.def("select_split", &launch_select_split, "Best split per node (CUDA)");
     m.def("bin_matrix", &launch_bin_matrix_kernel, "Quantile binning of a feature matrix (CUDA)");
-    m.def("predict_forest", &predict_with_forest, "Forest predictions with checkpoints (CUDA)");
+    m.def("predict_forest", &predict_with_forest, "Predictions of a forest block with checkpoints and carried sums (CUDA)");
 }

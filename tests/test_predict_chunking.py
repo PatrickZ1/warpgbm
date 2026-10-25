@@ -40,7 +40,9 @@ def test_predict_full_equals_two_subsets():
     np.testing.assert_allclose(full_preds, chunk_preds, rtol=1e-5, atol=1e-4)
 
 
-def test_flatten_cache_reused_and_invalidated_on_retraining():
+def test_device_copies_cached_per_block_and_released(monkeypatch):
+    from warpgbm.forest import Block, _device_key
+
     X, y = make_regression(
         n_samples=500,
         n_features=12,
@@ -52,39 +54,47 @@ def test_flatten_cache_reused_and_invalidated_on_retraining():
 
     model = _build_regression_model(X, y, n_estimators=20)
 
-    # Every round is flattened (packed) once; later predictions reuse it
-    call_counter = {"calls": 0}
-    original_pack = model._pack_tree
+    # The device copy of a block is uploaded once; later predictions reuse it
+    uploads = []
+    original = Block.device_arrays
 
-    def counted_pack(*args):
-        call_counter["calls"] += 1
-        return original_pack(*args)
+    def counted(self, device, cache=True):
+        if _device_key(device) not in self._device:
+            uploads.append(self.num_trees)
+        return original(self, device, cache)
 
-    model._pack_tree = counted_pack
+    monkeypatch.setattr(Block, "device_arrays", counted)
 
     model.predict(X[:200])
-    assert call_counter["calls"] == 20
-
+    assert uploads == [20]
     model.predict(X[200:400])
     model.predict(X[:50], num_trees=7)
     model.staged_predict(X[:50], [3, 9, 20])
-    assert call_counter["calls"] == 20
+    assert uploads == [20]
 
-    # Warm start: only the new rounds are packed
+    # Warm start: the training scores reuse the cached copy; the small block is extended
     model.warm_start = True
     model.n_estimators = 30
     model.fit(X, y)
+    assert uploads == [20] and len(model._forest_blocks()) == 1
     model.predict(X[:200])
-    assert call_counter["calls"] == 30
+    assert uploads == [20, 30]
 
-    # A fresh fit replaces the forest: everything is packed again
+    # A fresh fit replaces the forest
     model.warm_start = False
     model.n_estimators = 15
     model.fit(X, y)
-    model.predict(X[:200])
-    assert call_counter["calls"] == 45
+    ref10 = model.predict(X[:200], num_trees=10)
+    assert uploads == [20, 30, 15]
 
-    # truncate keeps the packed rounds it retains
+    # truncate copies the block part it keeps
     model.truncate(10)
-    model.predict(X[:200])
-    assert call_counter["calls"] == 45
+    np.testing.assert_array_equal(model.predict(X[:200]), ref10)
+    assert uploads == [20, 30, 15, 10]
+
+    # release drops the device copies; cache=False never stores one
+    model.release_prediction_cache()
+    assert model.memory_report()["device_cache_bytes"] == 0
+    np.testing.assert_array_equal(model.predict(X[:200], cache=False), ref10)
+    assert model.memory_report()["device_cache_bytes"] == 0
+    assert uploads == [20, 30, 15, 10, 10]

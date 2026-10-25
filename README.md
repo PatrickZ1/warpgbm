@@ -623,7 +623,8 @@ model_loaded.load_model('checkpoint.pkl')  # Restores everything
 ```python
 model.classes_                    # Unique class labels (classification only)
 model.num_classes                 # Number of classes (classification only)
-model.forest                      # Trained tree structures
+model.forest                      # Read-only view of the trees as dicts (built on access)
+model.round_active_outputs_       # Per round, the outputs its trees change
 model.training_loss               # Training loss (objective loss), if an eval set was given: one value per
                                   #   checkpoint (aligned with eval_iterations_) or per round (record_training_loss)
 model.evals_result_               # {"train": [...], "eval": [...]} eval metric per checkpoint (natural values)
@@ -700,7 +701,15 @@ Built on the shoulders of PyTorch, scikit-learn, LightGBM, XGBoost, and the CUDA
 
 ## 📝 Version History
 
-### v2.8.0 (Current)
+### v2.9.0 (Current)
+- 🧱 Compact forest storage: trees are immutable blocks of the actual nodes (no padding to the deepest round, leaf values only for the outputs a tree changes); no packed CPU caches. 17.6 KB → 0.6 KB per tree for the hedge chain, GPU cache of a depth-7 chain 802 MB → 7 MB
+- 🍴 `fork(n_new=..., **params)` and a cheap `copy.deepcopy`: copies share the parent's trees; `slice_rounds` of a fork's own rounds is zero-copy
+- 🧹 `release_prediction_cache()` and `predict(..., cache=False)`; training-only GPU tensors are released after `fit`
+- 🚀 `warpgbm.predict_many(models, X)`: bins once, evaluates shared parent rounds once (GPU and CPU)
+- ➕ `fit(init_scores=...)` (warm start), `fit(keep_train_predictions=False)`, `memory_report()`, `round_active_outputs_`
+- ⚠️ `model.forest` is a read-only view (same dicts, built on access); see docs/FORK_CHANGES.md §3.10
+
+### v2.8.0
 - 🎚️ Warm starts with new hyperparameters: every round keeps the learning rate and depth it was grown with (`round_learning_rates_`, `round_max_depths_`), so changing `learning_rate` or `max_depth` (larger or smaller) on a fitted model only affects the new rounds
 - ✂️ `slice_rounds(start, stop=None)`: a model with only the rounds `[start, stop)` and base score 0, e.g. to keep just the rounds a warm-started copy added (`parent.predict + slice.predict == copy.predict`)
 - ⚡ Vector trees are grown on the outputs that have targets only (`fit(active_outputs=...)` or NaN targets): same trees, 6–11× faster for copies trained on 1–4 of 20 outputs

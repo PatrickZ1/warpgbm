@@ -170,14 +170,17 @@ def test_feature_importance_follows_the_used_trees():
     with pytest.raises(ValueError, match="Per-era feature importance"):
         model.get_per_era_feature_importance(num_trees=5)
 
-    # trees without stored gains (older models): only the all-trees snapshot is available
-    for node_tree in model.forest[:total]:
+    # trees without stored gains (older models, loaded from tree dicts): only the all-trees
+    # snapshot is available
+    forest = model.forest[:total]
+    for node_tree in forest:
         stack = [node_tree]
         while stack:
             node = stack.pop()
             if "leaf_value" not in node:
                 node.pop("gain")
                 stack += [node["left"], node["right"]]
+    model._set_dict_forest(forest)
     np.testing.assert_allclose(model.get_feature_importance(num_trees=total, normalize=False), imp_all, rtol=1e-4)
     with pytest.raises(ValueError, match="per-split gains"):
         model.get_feature_importance(num_trees=5)
@@ -308,7 +311,7 @@ def test_warm_start_continues_after_all_trees_or_after_truncate():
     model.n_estimators = 8
     model.fit(X, y)
     assert model._trees_trained == 8 and model.best_iteration_ is None
-    assert all(model.forest[r] is first_rounds[r] for r in range(5))
+    assert all(model.forest[r] == first_rounds[r] for r in range(5))
     np.testing.assert_array_equal(model.predict(Xe), model.predict(Xe, num_trees=8))
 
     # truncate to the best round, then continue from there

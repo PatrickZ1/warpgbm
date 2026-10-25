@@ -477,6 +477,73 @@ Benchmark (`benchmarks/bench_inactive_outputs.py`, GTX 1660 Ti, 12k rows × 1000
 | structure copy, 4 of 20 outputs, 500 rounds | 23.9 s (47.7 ms/round) | 3.7 s (7.5 ms/round) | 6.4× |
 | output copy, 1 of 20 outputs, 300 rounds | 7.5 s (25.1 ms/round) | 0.68 s (2.3 ms/round) | 11× |
 
+### 3.10 Compact forest storage, shared copies, cache release, `predict_many` (v2.9.0)
+
+Driven by the hedge level chain (hedge_ts_v2 `warpgbm_v2_9_spec.md`, R1–R7): per (code, fold,
+seed) a K = 20 code model (600 rounds) → 5 copies (+500 rounds, 4 outputs) → 20 copies (+300
+rounds, 1 output), all kept alive during tuning. v2.8 padded every tree to `2^(max depth + 1)`
+nodes model-wide, kept three CPU copies of the packed forest plus a GPU copy, and `deepcopy`
+cloned all of it (GPU tensors included): a depth-7 copy level held ~0.8 GB of GPU cache per chain
+and the tuning study ran out of memory on a 6 GB GPU.
+
+**Storage (`warpgbm/forest.py`).** The trees live in immutable `Block`s of consecutive rounds:
+flat arrays of the *actual* nodes in pre-order (`feature`, `word` = bin | nan_left << 8 | right
+offset << 9 (a leaf's word holds its rows), `gain`), leaf values unscaled and only for the
+columns a tree changes (a 1-output copy stores 1 of 20, per-output trees their column), and the
+learning rate per tree. This *is* the prediction format: there are no packed CPU caches. The
+device copy of a block is cached on the block.
+
+* `model.forest` is a read-only view that builds the old tree dicts on access (same format,
+  `==` works; editing returned dicts does not change the model; length = trained rounds, no
+  trailing `{}` slots).
+* `copy.deepcopy`, `fork` and `slice_rounds` share blocks (and `bin_edges`); caches are never
+  copied or pickled. A fork's new rounds become a block of their own, so
+  `child.slice_rounds(parent.num_trees_)` is zero-copy. Pickles of several models store a shared
+  block once. Pickles / save files of v2.8 and older (dict forests) are converted on load.
+* A fit appends one block (small blocks built by the model itself are extended instead).
+
+**Prediction.** The CUDA kernel walks variable-length trees (no depth / M parameter), adds
+`leaf × lr` with explicit `__fmul_rn` / `__fadd_rn` per tree column (bit mask for K ≤ 32), and
+carries the tree sums from block to block (`init` / `acc_out`). The NumPy path does the same
+three stages (vectorized walk, leaf values × lr, sequential sums); GPU and CPU give identical
+raw scores. Measured against the installed v2.8.0 on the hedge-shaped chain the predictions were
+bit-identical, but this is not a guarantee of the format (float tolerance is the contract).
+
+**New API.**
+
+| | |
+|---|---|
+| `release_prediction_cache(device=None)` | drops the device copies of the trees (shared blocks: also for the models sharing them, rebuilt lazily), cached base score, CPU edges (R1). `_invalidate_prediction_cache` remains as an alias |
+| `predict*(..., cache=False)` | temporary device copy for this call only (R1) |
+| `fork(n_new=None, **params)` | warm-start-ready copy sharing the trees; params via `set_params`; `n_estimators = num_trees_ + n_new` (R4) |
+| `fit(init_scores=...)` | warm start only: raw scores (base included) of the model on these rows, e.g. `parent.predict_raw(X)[rows]`, skip recomputing them (R5) |
+| `fit(keep_train_predictions=False)` | no `train_predictions_` (R7) |
+| `warpgbm.predict_many(models, X, num_trees=None, device=None, raw=False, cache=True)` | bins once per binning; blocks shared by several models (parent rounds of forks) evaluated once with carried sums; on the CPU one vectorized walk of all models' trees (R7) |
+| `memory_report()` | forest / device cache / CPU cache / train predictions / edges / other device bytes |
+| `round_active_outputs_` | per round, the columns its trees change |
+
+R2 (per-depth packing) is solved by the variable-length layout; R6: pre-binned models have no
+edges, raw-feature slices / forks share them. After `fit` the training-only device tensors
+(`feature_indices`, `feat_indices_tree`, monotone vectors, count scale) are released and
+`unique_eras` moves to the CPU.
+
+**Measured** (`benchmarks/bench_chain.py`, GTX 1660 Ti, 12k × 1863 prebinned, 64 bins, K = 20,
+600 / 5 × 500 / 20 × 300 rounds; v2.8.0 installed vs v2.9.0):
+
+| | v2.8.0 | v2.9.0 |
+|---|---|---|
+| chain fit, copies depth 4 / depth 7 | 33.5 s / 60.9 s | 22.8 s / 42.5 s |
+| 25 deepcopies (v2.8) / forks (v2.9) | 5.4 s | 0.02 s |
+| GPU predict, 26 full models × 4k rows, first call | 3209 ms | 269 ms (`predict_many` 78 ms) |
+| GPU cache held after that, depth 4 / depth 7 | 101 MB / 802 MB | 3.3 MB / 6.7 MB |
+| `slice_rounds` of 25 copies, depth 4 / 7 | 1.6 s / 5.8 s | 8 ms / 10 ms |
+| 26 compacted models, CPU bytes (depth 4) | 152 MB (17.6 KB/tree) | 5.4 MB (0.63 KB/tree) |
+| CPU 4-row chain predict (26 calls) / `predict_many` | 13.1 ms / – | 9.6 ms / 4.4 ms |
+
+Tuning pattern (chains kept alive unsliced, every model predicts val + train rows, no release;
+depth-7 copies): v2.8 +805 MB allocated GPU memory per chain (OOM after ~6 chains on 6 GB),
+v2.9 +6.7 MB per chain, training peak flat at ~210 MB.
+
 ---
 
 ## 4. Behaviour changes to be aware of
@@ -508,6 +575,10 @@ Benchmark (`benchmarks/bench_inactive_outputs.py`, GTX 1660 Ti, 12k rows × 1000
 | hyperparameter checks (v2.8.0) | constructor only | also at every `fit` (attributes changed on a fitted model are checked); numpy scalars accepted |
 | outputs without targets (v2.8.0) | trees grown on all K outputs | grown on the active outputs only (same trees in deterministic mode, see §3.9); `L2_reg = 0` now gives leaf 0 instead of NaN there |
 | `era_indices` after `fit` (v2.8.0) | kept the `[N]` training era tensor | released |
+| `forest` (v2.9.0) | list of tree dicts (mutable, vector forests padded with `{}` to `n_estimators`) | read-only view building the same dicts on access; length = trained rounds; edits do not reach the model |
+| `copy.deepcopy` (v2.9.0) | copied everything incl. GPU caches | shares the immutable tree blocks and `bin_edges`; never copies caches |
+| save files (v2.9.0) | `"forest"` (dicts) | `"forest_blocks"`; older files load, v2.8 cannot read v2.9 files |
+| internal API (v2.9.0) | `_packed_forest`, `_pack_round`, `_pack_tree`, `_flat_forest_cpu`, `_tree_from_records`, CUDA `predict_forest(nodes [T, M, 4], leaf, out_col, ...)` | `warpgbm/forest.py` blocks, `_add_tree_from_records`, CUDA `predict_forest(nodes [n, 2], values, meta, lr, cols, K, init, base, nan_bin, ckpt, out, acc_out)` |
 
 ---
 

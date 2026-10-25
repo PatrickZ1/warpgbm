@@ -39,6 +39,16 @@ from warpgbm.binning import (
     _to_float_gpu,
 )
 from warpgbm.cuda import _get_node_kernel
+from warpgbm.forest import (
+    Block,
+    ForestBuilder,
+    ForestView,
+    _to_device,
+    blocks_from_dicts,
+    blocks_prefix,
+    blocks_range,
+    trie_sums_cpu,
+)
 
 
 @dataclass
@@ -91,6 +101,92 @@ def _on_model_device(method):
 
     return wrapper
 
+# A fit appends its rounds to the model's last block instead of a new block while that block
+# (built by the model itself) has fewer trees than this (see WarpGBM._freeze_forest)
+_MERGE_TREES = 256
+
+
+def _run_block(bins, feature_major, block, n_trees, K, nan_bin, init, base, ckpt, out, acc, cache):
+    """
+    One launch of the CUDA predictor over the first n_trees trees of block, continuing the tree
+    sums init ([N, K] or None for 0): out[p] = base + sums after ckpt[p] trees (out [P, N, K] or
+    None), acc = sums after n_trees trees ([N, K] or None).
+    """
+    if feature_major:
+        num_rows, row_stride, feat_stride = bins.size(1), 1, bins.size(1)
+    else:
+        num_rows, row_stride, feat_stride = bins.size(0), bins.size(1), 1
+    nodes, values, meta, lr, cols = block.device_arrays(bins.device, cache)
+    if acc is None and K > 32:
+        acc = torch.empty((num_rows, K), dtype=torch.float32, device=bins.device)
+    _get_node_kernel().predict_forest(
+        bins.contiguous(), row_stride, feat_stride, num_rows, nodes, values, meta[:n_trees],
+        lr[:n_trees], cols, K, init, base, nan_bin,
+        _to_device(np.asarray(ckpt, dtype=np.int64), bins.device), out, acc,
+    )
+
+
+def _segment_plan(blocks, rounds):
+    """
+    For ascending round counts: (number of leading zeros of rounds, [(block, n_trees, p, q,
+    tree counts of the checkpoints rounds[p:q])] for the blocks that are needed).
+    """
+    P = len(rounds)
+    p = 0
+    while p < P and rounds[p] == 0:
+        p += 1
+    zeros, plan, lo = p, [], 0
+    for block in blocks:
+        if p >= P:
+            break
+        hi = lo + block.num_rounds
+        q = p
+        while q < P and rounds[q] <= hi:
+            q += 1
+        n_trees = int(block.round_start[min(rounds[-1], hi) - lo])
+        ckpt = [int(block.round_start[r - lo]) for r in rounds[p:q]]
+        plan.append((block, n_trees, p, q, ckpt))
+        p, lo = q, hi
+    if p < P:
+        raise ValueError(f"round count {rounds[p]} exceeds the {lo} stored rounds")
+    return zeros, plan
+
+
+def _predict_segments(bins, feature_major, blocks, rounds, K, nan_bin, base, out, init=None, cache=True):
+    """
+    out[p] = base + sums of the trees of the first rounds[p] rounds of blocks (rounds ascending),
+    on the GPU, continuing from the tree sums init. The sums are carried from block to block, so
+    the result does not depend on how the rounds are split into blocks.
+    """
+    zeros, plan = _segment_plan(blocks, rounds)
+    for p in range(zeros):
+        out[p] = base + (init if init is not None else torch.zeros_like(out[p]))
+    acc = init
+    for j, (block, n_trees, p, q, ckpt) in enumerate(plan):
+        acc_out = torch.empty_like(out[0]) if j + 1 < len(plan) else None
+        _run_block(
+            bins, feature_major, block, n_trees, K, nan_bin, acc, base, ckpt,
+            out[p:q] if q > p else None, acc_out, cache,
+        )
+        acc = acc_out
+    return out
+
+
+def _predict_segments_cpu(bins, blocks, rounds, K, nan_bin, base, init=None):
+    """NumPy version of _predict_segments for internal bins [N, F]: returns [P, N, K] float32."""
+    n = bins.shape[0]
+    out = np.empty((len(rounds), n, K), dtype=np.float32)
+    acc = np.zeros((n, K), dtype=np.float32) if init is None else init
+    zeros, plan = _segment_plan(blocks, rounds)
+    for p in range(zeros):
+        out[p] = base + acc
+    for block, n_trees, p, q, ckpt in plan:
+        acc, at_ckpt = block.scores_cpu(bins, nan_bin, n_trees, acc, ckpt)
+        for j, sums in enumerate(at_ckpt):
+            out[p + j] = base + sums
+    return out
+
+
 # Fraction of the free GPU memory (at fit) that the histograms of one tree level may use;
 # above it a level is processed in node chunks without histogram subtraction
 _HIST_MEMORY_FRACTION = 0.4
@@ -117,15 +213,17 @@ class WarpGBM(BaseEstimator, RegressorMixin):
     prebinned_ = False
     record_training_loss = "all"
     deterministic = True
-    # Prediction caches (see _invalidate_prediction_cache)
-    _pack_rounds = None
-    _pack_concat = None
-    _pack_device = None
-    _pack_key = None
+    # Trees: immutable blocks of rounds (warpgbm/forest.py), shared by copies, forks and slices,
+    # and the rounds of the running fit (_builder)
+    _blocks = ()
+    _builder = None
+    # Last block built by this model's own fit, extended in place of a new small block
+    _merge_tail = None
+    # Prediction caches (see release_prediction_cache); the device copies of the trees are
+    # cached on the blocks
     _edges_cpu = None
     _base_cpu = None
     _base_gpu = None
-    _flat_cpu = None
     _tree_graphs = {}
     # Replay trees as CUDA graphs (see _run_tree); False runs every tree eagerly
     _use_cuda_graphs = True
@@ -138,6 +236,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
     # Model of a slice of boosting rounds without a base score (see slice_rounds)
     _is_slice = False
     _active_cols = None
+    _keep_train_predictions = True
 
     def __init__(
         self,
@@ -184,7 +283,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.max_depth = max_depth
         self.learning_rate = learning_rate
         self.n_estimators = n_estimators
-        self.forest = None
+        self._blocks = ()
+        self._builder = None
+        self._merge_tail = None
         self.bin_edges = None
         self.base_prediction = None
         self.unique_eras = None
@@ -203,7 +304,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.min_split_gain = min_split_gain
         self.min_sum_hessian = min_sum_hessian
         self.L2_reg = L2_reg
-        self.forest = [{} for _ in range(self.n_estimators)]
         self.colsample_bytree = colsample_bytree
         self.random_state = random_state
         self.warm_start = warm_start
@@ -226,7 +326,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._trees_trained = 0  # Track number of trees already trained
         self.round_learning_rates_ = []
         self.round_max_depths_ = []
-        self._invalidate_prediction_cache()
+        self.release_prediction_cache()
         self._objective_source = None
         self._reset_eval_state()
         self._per_era_importance_all = None
@@ -455,9 +555,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
     def _to_device(self, array):
         """numpy array -> tensor on the model device, copied asynchronously from pinned memory."""
-        return torch.from_numpy(np.ascontiguousarray(array)).pin_memory().to(
-            self.device, non_blocking=True
-        )
+        return _to_device(array, self.device)
 
     def _store_base_score(self, base):
         """Keep the legacy representation: a float for single-output regression."""
@@ -740,30 +838,76 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         )
         return Y_gpu, tw
 
-    # ─── Packed forest (prediction) ───
+    # ─── Forest storage and prediction ───
     #
-    # Every boosting round is flattened once into numpy arrays (see warpgbm/cuda/predict.cu):
-    #   nodes [t, M, 4] int32: feature (-1 = leaf), split_bin | nan_left << 8, left, right
-    #   leaf  [t, M, Lw] float32: leaf values times the round's learning rate (Lw = K for vector trees)
-    #   out_col [t] int32: score column of each tree (per-output forests only)
-    # where t is the number of trees of the round and M = 2^(D + 1) for the deepest round D (see
-    # round_max_depths_). Rounds are packed lazily and kept until the forest changes (fresh fit,
-    # truncate, load, a deeper round); the first n rounds are a prefix of the concatenation, so
-    # any num_trees is a slice and never re-flattens. Every round keeps the learning rate it was
-    # grown with (round_learning_rates_): changing learning_rate only affects later rounds.
+    # The trees are stored in immutable blocks of consecutive rounds (warpgbm/forest.py): flat
+    # arrays of the actual nodes, leaf values only for the outputs a tree changes, and the
+    # learning rate of every round (round_learning_rates_: changing learning_rate only affects
+    # later rounds). The CPU and GPU predictors read the blocks directly. A block is never
+    # modified, so copies, forks and slices share blocks, and the device copy of a block (cached
+    # on the block) as well. A fit collects its rounds in _builder and appends them as one block.
+
+    def _forest_blocks(self):
+        """The blocks of all trained rounds (the rounds of an interrupted fit become a block)."""
+        if self._builder is not None and self._builder.num_rounds:
+            self._freeze_forest()
+        return self._blocks
+
+    def _freeze_forest(self):
+        """Append the rounds collected in _builder as a block (a small own last block is extended)."""
+        builder, self._builder = self._builder, None
+        block = builder.build() if builder is not None else None
+        if block is None:
+            return
+        blocks = self._blocks
+        # Many short warm starts must not create many tiny blocks (one kernel launch each); only a
+        # block built by this model is extended (inherited blocks stay shared with their owner)
+        if blocks and blocks[-1] is self._merge_tail and blocks[-1].num_trees < _MERGE_TREES:
+            block = Block.concat([blocks[-1], block])
+            blocks = blocks[:-1]
+        self._blocks = blocks + (block,)
+        self._merge_tail = block
+
+    def _set_dict_forest(self, rounds):
+        """Store a forest of tree dicts (pickles and save files of v2.8 and older)."""
+        n = self._trees_trained
+        rates = self.round_learning_rates_
+        if rates is None:
+            rates = [float(self.learning_rate)] * n
+        per_output = self._output_strategy() == PER_OUTPUT
+        self._blocks = blocks_from_dicts(list(rounds)[:n], rates, self.num_outputs, per_output)
+        self._builder = None
+        self._merge_tail = None
+
+    @property
+    def forest(self):
+        """
+        Read-only view of the trained rounds as tree dicts: forest[r] is the tree of round r (a
+        list of K trees for per-output objectives), built on access (see warpgbm.forest.ForestView).
+        """
+        per_output = self.objective_ is not None and self._output_strategy() == PER_OUTPUT
+        return ForestView(self._forest_blocks(), self.num_outputs or 1, per_output)
+
+    def release_prediction_cache(self, device=None):
+        """
+        Drop the prediction caches: the device copies of the trees, the cached base score and the
+        CPU copy of the bin edges. The next predict rebuilds what it needs lazily; predictions are
+        unchanged, the trees, bin edges and importances are not touched.
+
+        The device copy of a block of trees is shared by all models holding that block (copies,
+        forks, slices of this model): it is dropped for them too and rebuilt on their next predict.
+        device: drop only the copies on this device (None: all).
+        """
+        for block in self._forest_blocks():
+            block.release(device)
+        self._base_gpu = None
+        self._base_cpu = None
+        self._edges_cpu = None
+        return self
 
     def _invalidate_prediction_cache(self, keep_rounds=0):
-        """Drop packed rounds from keep_rounds on, and all concatenations."""
-        packs = self._pack_rounds
-        self._pack_rounds = [] if not packs else packs[:keep_rounds]
-        self._pack_concat = None
-        self._pack_device = None
-        self._flat_cpu = None
-        if keep_rounds == 0:
-            self._pack_key = None
-            self._edges_cpu = None
-            self._base_cpu = None
-            self._base_gpu = None
+        """Alias of release_prediction_cache (kept for callers of v2.8)."""
+        return self.release_prediction_cache()
 
     @staticmethod
     def _tree_depth(tree):
@@ -788,228 +932,48 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.round_learning_rates_ = [float(self.learning_rate)] * n
         if self.round_max_depths_ is None:
             depths = []
-            for round_trees in (self.forest or [])[:n]:
+            for round_trees in self.forest[:n]:
                 trees = round_trees if isinstance(round_trees, list) else [round_trees]
                 depths.append(max([self._tree_depth(t) for t in trees], default=0))
             self.round_max_depths_ = depths
 
-    def _pack_layout(self):
-        """(max nodes per tree, leaf width, per-output) of the packed forest."""
-        self._ensure_round_meta()
-        per_output = self._output_strategy() == PER_OUTPUT
-        leaf_width = 1 if per_output else self.num_outputs
-        depth = max(self.round_max_depths_, default=self.max_depth)
-        return 2 ** (depth + 1), leaf_width, per_output
+    @property
+    def round_active_outputs_(self):
+        """Per trained round, the sorted tuple of score columns its trees change (non-zero leaves)."""
+        return [b.round_columns(r) for b in self._forest_blocks() for r in range(b.num_rounds)]
 
-    def _pack_tree(self, tree, max_nodes, leaf_width, learning_rate):
-        """Flatten one tree dict (pre-order node ids) into (nodes [M, 4], leaf [M, Lw])."""
-        nodes = np.zeros((max_nodes, 4), dtype=np.int32)
-        nodes[:, 0] = -1
-        leaf = np.zeros((max_nodes, leaf_width), dtype=np.float32)
-        counter = 0
-        stack = [(tree, None, 0)]  # (node, parent id, 2 = left / 3 = right)
-        while stack:
-            node, parent, side = stack.pop()
-            i = counter
-            counter += 1
-            if parent is not None:
-                nodes[parent, side] = i
-            if "leaf_value" in node:
-                value = node["leaf_value"]
-                if isinstance(value, torch.Tensor):
-                    value = value.detach().cpu().tolist()
-                if isinstance(value, (list, tuple, np.ndarray)):
-                    leaf[i] = np.asarray(value, dtype=np.float32)[:leaf_width]
-                else:
-                    leaf[i] = value
-            else:
-                nodes[i, 0] = int(node["feature"])
-                nodes[i, 1] = int(node["bin"]) | (int(bool(node.get("nan_left", False))) << 8)
-                # Right is pushed first so that the left subtree gets the next ids
-                stack.append((node["right"], i, 3))
-                stack.append((node["left"], i, 2))
-        leaf *= np.float32(learning_rate)
-        return nodes, leaf
-
-    def _pack_round(self, round_trees, learning_rate):
-        max_nodes, leaf_width, per_output = self._pack_layout()
-        trees = round_trees if per_output else [round_trees]
-        packed = [
-            (self._pack_tree(tree, max_nodes, leaf_width, learning_rate), k)
-            for k, tree in enumerate(trees)
-            if tree
-        ]
-        nodes = np.zeros((len(packed), max_nodes, 4), dtype=np.int32)
-        leaf = np.zeros((len(packed), max_nodes, leaf_width), dtype=np.float32)
-        out_col = np.zeros(len(packed), dtype=np.int32)
-        for j, ((n, l), k) in enumerate(packed):
-            nodes[j], leaf[j], out_col[j] = n, l, k
-        return nodes, leaf, out_col
-
-    def _ensure_packed(self, num_rounds):
-        # The learning rates are fixed per round; the layout changes with the deepest round
-        key = (self._pack_layout()[0], self.num_outputs, self._output_strategy())
-        if self._pack_key != key:
-            self._invalidate_prediction_cache()
-            self._pack_key = key
-        rates = self.round_learning_rates_
-        for r in range(len(self._pack_rounds), num_rounds):
-            self._pack_rounds.append(self._pack_round(self.forest[r], rates[r]))
-
-    def _packed_forest(self, num_rounds, device=None):
+    def _predict_raw_staged_binned(self, bins, rounds, feature_major=False, base=None, cache=True):
         """
-        Packed first num_rounds rounds: (nodes, leaf, out_col or None, round_end) as numpy
-        arrays (device=None) or tensors on device. round_end[r] = trees in rounds 0..r.
+        Raw scores [P, N, K] after rounds[p] boosting rounds (rounds ascending), on the GPU, for
+        internal bins [N, F] (feature-major [F, N] with feature_major=True). base: [K] score the
+        trees are added to (default: the model's base score).
         """
-        self._ensure_packed(num_rounds)
-        if self._pack_concat is None or self._pack_concat[0] < num_rounds:
-            packs = self._pack_rounds
-            max_nodes, leaf_width, per_output = self._pack_layout()
-            if packs:
-                nodes = np.concatenate([p[0] for p in packs])
-                leaf = np.concatenate([p[1] for p in packs])
-                out_col = np.concatenate([p[2] for p in packs])
-            else:
-                nodes = np.zeros((0, max_nodes, 4), dtype=np.int32)
-                leaf = np.zeros((0, max_nodes, leaf_width), dtype=np.float32)
-                out_col = np.zeros(0, dtype=np.int32)
-            round_end = np.cumsum([len(p[0]) for p in packs], dtype=np.int64)
-            self._pack_concat = (len(packs), nodes, leaf, out_col if per_output else None, round_end)
-            self._pack_device = None
-        _, nodes, leaf, out_col, round_end = self._pack_concat
-        n_trees = int(round_end[num_rounds - 1]) if num_rounds > 0 else 0
-        if device is None:
-            return (
-                nodes[:n_trees],
-                leaf[:n_trees],
-                None if out_col is None else out_col[:n_trees],
-                round_end[:num_rounds],
-            )
-        if self._pack_device is None or self._pack_device[0] != (self._pack_concat[0], str(device)):
-            self._pack_device = (
-                (self._pack_concat[0], str(device)),
-                self._to_device(nodes),
-                self._to_device(leaf),
-                None if out_col is None else self._to_device(out_col),
-            )
-        _, nodes_t, leaf_t, out_col_t = self._pack_device
-        return (
-            nodes_t[:n_trees],
-            leaf_t[:n_trees],
-            None if out_col_t is None else out_col_t[:n_trees],
-            round_end[:num_rounds],
-        )
-
-    def _forest_kernel(self, bins, nodes, leaf, out_col, base, tree_counts, feature_major=False):
-        """
-        Raw scores [P, N, K] = base + sum of the first tree_counts[p] packed trees, on the GPU.
-        bins is row-major [N, F] or feature-major [F, N] (feature_major=True).
-        """
-        if feature_major:
-            num_rows = bins.size(1)
-            row_stride, feat_stride = 1, bins.size(1)
-        else:
-            num_rows = bins.size(0)
-            row_stride, feat_stride = bins.size(1), 1
-        ckpt = self._to_device(np.asarray(tree_counts, dtype=np.int64))
-        out = torch.empty(
-            (len(tree_counts), num_rows, self.num_outputs), device=self.device, dtype=torch.float32
-        )
-        _get_node_kernel().predict_forest(
-            bins.contiguous(),
-            row_stride,
-            feat_stride,
-            num_rows,
-            nodes,
-            leaf,
-            out_col,
-            base.contiguous(),
-            self.nan_bin,
-            ckpt,
-            out,
-        )
-        return out
-
-    def _predict_raw_staged_binned(self, bin_indices, rounds, feature_major=False, base=None):
-        """
-        Raw scores [P, N, K] after rounds[p] boosting rounds (rounds ascending), on the GPU.
-        base: [K] score the trees are added to (default: the model's base score).
-        """
-        nodes, leaf, out_col, round_end = self._packed_forest(max(rounds), self.device)
-        tree_counts = [int(round_end[r - 1]) if r > 0 else 0 for r in rounds]
         if base is None:
-            base = self._base_score_tensor()
-        return self._forest_kernel(
-            bin_indices, nodes, leaf, out_col, base, tree_counts, feature_major
+            base = self._base_score_tensor() if cache else self._to_device(self._base_score_np())
+        num_rows = bins.size(1) if feature_major else bins.size(0)
+        out = torch.empty(
+            (len(rounds), num_rows, self.num_outputs), device=bins.device, dtype=torch.float32
         )
-
-    def _flat_forest_cpu(self, num_rounds):
-        """
-        Packed forest as flat per-field arrays over global node ids t * M + j, with the children
-        as global ids (cached with the packed forest): (feature, split_bin, nan_left, left, right,
-        leaf [T * M, Lw], out_col, round_end).
-        """
-        _, _, out_col, round_end = self._packed_forest(num_rounds)
-        # Flatten the whole concatenation once; a prefix of rounds only visits its own trees
-        key, nodes, leaf = self._pack_concat[:3]
-        flat = self._flat_cpu
-        if flat is None or flat[0] != key:
-            T, M = nodes.shape[:2]
-            offset = (np.arange(T, dtype=np.int64) * M)[:, None]
-            flat = (
-                key,
-                nodes[..., 0].reshape(-1),
-                (nodes[..., 1] & 0xFF).reshape(-1),
-                ((nodes[..., 1] >> 8) & 1).astype(bool).reshape(-1),
-                (nodes[..., 2] + offset).reshape(-1),
-                (nodes[..., 3] + offset).reshape(-1),
-                leaf.reshape(T * M, leaf.shape[2]),
-            )
-            self._flat_cpu = flat
-        return flat[1:] + (out_col, round_end, nodes.shape[1])
+        return _predict_segments(
+            bins, feature_major, self._forest_blocks(), rounds, self.num_outputs, self.nan_bin,
+            base.contiguous(), out, cache=cache,
+        )
 
     def _predict_raw_staged_cpu(self, bins, rounds):
         """CPU version of _predict_raw_staged_binned for internal bins [N, F] (numpy int8)."""
-        feature, split_bin, nan_left, left, right, leaf, out_col, round_end, M = (
-            self._flat_forest_cpu(max(rounds))
+        return _predict_segments_cpu(
+            bins, self._forest_blocks(), rounds, self.num_outputs, self.nan_bin, self._base_score_np()
         )
-        tree_counts = [int(round_end[r - 1]) if r > 0 else 0 for r in rounds]
-        base = self._base_score_np()
-        K = self.num_outputs
-        n, T = bins.shape[0], max(tree_counts)
-        out = np.empty((len(rounds), n, K), dtype=np.float32)
-        if T == 0 or n == 0:
-            out[:] = base
-            return out
-        roots = np.arange(T, dtype=np.int64) * M
-        F = bins.shape[1]
-        # Bound the [rows, T, K] intermediate arrays
-        chunk = max(1, (1 << 22) // (T * max(K, 4)))
-        for start in range(0, n, chunk):
-            b = bins[start : start + chunk]
-            rows = b.shape[0]
-            flat_bins = b.reshape(-1).astype(np.int64)
-            row_offset = (np.arange(rows, dtype=np.int64) * F)[:, None]
-            node = np.broadcast_to(roots, (rows, T)).copy()
-            # M = 2^(D + 1): D + 1 levels for the deepest tree
-            for _ in range(M.bit_length() - 1):
-                f = feature[node]
-                is_leaf = f < 0
-                if is_leaf.all():
-                    break
-                x = flat_bins[row_offset + np.maximum(f, 0)]
-                go_left = np.where(x == self.nan_bin, nan_left[node], x <= split_bin[node])
-                node = np.where(is_leaf, node, np.where(go_left, left[node], right[node]))
-            values = leaf[node]  # [rows, T, Lw]
-            if out_col is not None:
-                dense = np.zeros((rows, T, K), dtype=np.float32)
-                dense[:, np.arange(T), out_col[:T]] = values[..., 0]
-                values = dense
-            # Sequential float32 sums over the trees, the same additions as the CUDA kernel
-            cum = np.add.accumulate(values, axis=1)
-            for p, t in enumerate(tree_counts):
-                acc = cum[:, t - 1] if t > 0 else np.zeros((rows, K), dtype=np.float32)
-                out[p, start : start + chunk] = base + acc
+
+    def _block_segments(self, num_rounds):
+        """[(block, trees used)] of the first num_rounds rounds."""
+        out, left = [], num_rounds
+        for block in self._forest_blocks():
+            if left <= 0:
+                break
+            r = min(left, block.num_rounds)
+            out.append((block, int(block.round_start[r])))
+            left -= r
         return out
 
     # ─── Fit ───
@@ -1030,6 +994,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         eval_aux=None,
         train_aux=None,
         active_outputs=None,
+        init_scores=None,
+        keep_train_predictions=True,
     ):
         """
         Fit the model (continue training with warm_start=True on a fitted model).
@@ -1043,6 +1009,15 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         multi_regression). The other outputs are treated as missing targets in the training and
         eval sets: their leaf values are 0. Outputs without any positive-weight target are
         detected and skipped automatically; trees are grown on the active outputs only.
+
+        init_scores: warm start only. Raw scores [N, K] ([N] for K = 1) of the fitted model on
+        exactly these training rows, base score included, e.g. model.predict_raw(X) computed once
+        for several warm-started copies of a model. The model then skips recomputing them; the
+        caller guarantees that they belong to this model and these rows (predict_raw gives the
+        same trees as without init_scores).
+
+        keep_train_predictions: store the in-sample raw scores as train_predictions_ (False: None,
+        saves a device-to-host copy and N x K floats per model).
         """
         self._validate_hyperparams(**{name: getattr(self, name) for name in _VALIDATED_HYPERPARAMS})
         if self.warm_start and self._is_fitted and self._is_slice:
@@ -1096,7 +1071,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.training_loss = []
             self._reset_eval_state()
             self._per_era_importance_all = None
-            self._invalidate_prediction_cache()
+            self._blocks = ()
+            self._builder = None
+            self._merge_tail = None
+            self._base_cpu = self._base_gpu = self._edges_cpu = None
         else:
             # Continuing training: validate that data is compatible
             if X.shape[1] != self.num_features:
@@ -1126,6 +1104,11 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         # ─── Targets ───
         y_prepared, y_eval_prepared = self._prepare_targets(y, y_eval, continuing)
         n_outputs = self.objective_.num_outputs(y_prepared)
+        if init_scores is not None and not continuing:
+            raise ValueError(
+                "init_scores is only supported when continuing training (warm_start=True on a "
+                "fitted model)."
+            )
         if continuing and self.num_outputs is not None and self.num_outputs != n_outputs:
             raise ValueError(
                 "Number of target outputs must match the fitted model when warm_start=True. "
@@ -1134,12 +1117,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.num_outputs = n_outputs
         self._targets_1d = y.ndim == 1
         keep = self._active_output_mask(active_outputs, y_prepared.shape[1])
-
-        if not continuing:
-            self.forest = (
-                [] if self._output_strategy() == PER_OUTPUT
-                else [{} for _ in range(self.n_estimators)]
-            )
+        self._keep_train_predictions = bool(keep_train_predictions)
+        # Rounds of this fit, appended to the blocks at the end (see _freeze_forest)
+        self._forest_blocks()
+        self._builder = ForestBuilder(n_outputs)
 
         # ─── Train data preprocessing ───
         self.bin_indices, self.era_indices, self.bin_edges, self.unique_eras = (
@@ -1197,7 +1178,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 )
             self._store_base_score(base)
 
-        self.scores = self._predict_raw_binned(self.bins_fm, self._trees_trained, feature_major=True)
+        if init_scores is not None:
+            self.scores = self._init_scores_tensor(init_scores)
+        else:
+            self.scores = self._predict_raw_binned(
+                self.bins_fm, self._trees_trained, feature_major=True
+            )
         self._best_train_scores = None
         self._train_aux = self._aux_tensor(train_aux)
 
@@ -1219,6 +1205,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self._eval_aux = self._aux_tensor(eval_aux)
             # Tree sums without the base score, see _add_round_to_eval_scores
             zero = torch.zeros(self.num_outputs, dtype=torch.float32, device=self.device)
+            self._eval_zero = zero
             self._eval_acc = self._predict_raw_staged_binned(
                 self.bin_indices_eval, [self._trees_trained], base=zero
             )[0]
@@ -1237,11 +1224,14 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         with torch.no_grad():
             self.grow_forest()
 
+        self._freeze_forest()
+
         # In-sample raw scores of the default model (best round when rolled back)
-        train_scores = self.scores
-        if self._default_num_trees() != self._trees_trained and self._best_train_scores is not None:
-            train_scores = self._best_train_scores
-        self.train_predictions_ = train_scores.cpu().numpy()
+        if self._keep_train_predictions:
+            train_scores = self.scores
+            if self._default_num_trees() != self._trees_trained and self._best_train_scores is not None:
+                train_scores = self._best_train_scores
+            self.train_predictions_ = train_scores.cpu().numpy()
 
         # Release training buffers
         self.bin_indices = None
@@ -1263,9 +1253,33 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._train_aux = None
         self._best_train_scores = None
         self._active_cols = None
+        self._eval_zero = None
         self._rng = None
+        # Device tensors that only training reads (rebuilt by the next fit)
+        self.feature_indices = None
+        self.feat_indices_tree = None
+        self._mono_vec_gpu = None
+        self.monotonic_required_split_direction_gpu_ = None
+        self._count_scale = None
+        self.unique_eras = self.unique_eras.cpu()
 
         return self
+
+    def _init_scores_tensor(self, init_scores):
+        """Validated warm-start scores [N, K] as a new float32 tensor on the model device."""
+        if torch.is_tensor(init_scores):
+            scores = init_scores.detach().to(device=self.device, dtype=torch.float32)
+        else:
+            scores = self._to_device(np.asarray(init_scores, dtype=np.float32))
+        shape = (self.num_samples, self.num_outputs)
+        if scores.ndim == 1 and self.num_outputs == 1:
+            scores = scores.view(-1, 1)
+        if tuple(scores.shape) != shape:
+            raise ValueError(f"init_scores must have shape {shape}, got {tuple(scores.shape)}.")
+        if not bool(torch.isfinite(scores).all()):
+            raise ValueError("init_scores must be finite.")
+        # Training updates the scores in place: never the caller's tensor
+        return scores.clone().contiguous()
 
     def _active_output_mask(self, active_outputs, num_targets):
         """fit's active_outputs as a [K] bool tensor on the device (None: all outputs)."""
@@ -1663,7 +1677,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
     def _grow_tree_device(self, grad, hess):
         """
         Grow one tree on the GPU, without host syncs. Returns the training score update
-        [N, Kc] and the tree as a float64 record tensor (see _tree_from_records).
+        [N, Kc] and the tree as a float64 record tensor (see _add_tree_from_records).
         """
         kernel = _get_node_kernel()
         dev = self.device
@@ -1769,49 +1783,52 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         records.append(finite.double().view(1))
         return update, torch.cat(records)
 
-    def _tree_from_records(self, host, Kc, cols=None):
+    def _add_tree_from_records(self, host, Kc, cols, learning_rate):
         """
-        Tree dict from the records of _grow_tree_device: per level d, [2^d, 6 + E + Kc] rows
-        (active, valid split, feature, candidate, gain, rows, per-era gains, node values),
-        then the finiteness flag of the gradients. cols: the K score columns of the Kc node
-        values (the leaves of the other outputs are 0), None for all.
+        Add the tree of the records of _grow_tree_device to the fit's rounds (_builder): per level
+        d, [2^d, 6 + E + Kc] rows (active, valid split, feature, candidate, gain, rows, per-era
+        gains, node values), then the finiteness flag of the gradients. cols: the score columns of
+        the Kc node values (None: all K). Nodes are stored in pre-order; the per-era split gains
+        are added to the importance in the same order.
         """
         if not host[-1]:
             raise FloatingPointError(
                 f"Objective {self.objective_!r} produced non-finite gradients or hessians."
             )
-        D = self.max_depth
         Bv = self.num_bins
         E = self.num_eras
         width = 6 + E + Kc
         levels = []
         offset = 0
-        for d in range(D + 1):
+        for d in range(self.max_depth + 1):
             levels.append(host[offset : offset + (width << d)].reshape(1 << d, width))
             offset += width << d
         importance = self._feature_importance_acc
 
-        def build(d, j):
+        feature, word, gain, leaves = [], [], [], []
+        depth = 0
+        stack = [(0, 0, -1)]  # (level, node, node whose right-child offset points here)
+        while stack:
+            d, j, patch = stack.pop()
+            i = len(feature)
+            if patch >= 0:
+                word[patch] |= (i - patch) << 9
             r = levels[d][j]
             if r[1]:
-                feature, cand = int(r[2]), int(r[3])
-                # Pre-order, like the order in which splits are made
-                importance[:, feature] += r[6 : 6 + E].astype(np.float32)
-                node = {"feature": feature, "bin": cand % Bv, "nan_left": cand >= Bv}
-                node["left"] = build(d + 1, 2 * j)
-                node["right"] = build(d + 1, 2 * j + 1)
-                node["gain"] = float(r[4])
-                return node
-            value = r[6 + E :]
-            if cols is not None:
-                leaf_value = [0.0] * self.num_outputs
-                for c, v in zip(cols, value):
-                    leaf_value[c] = float(v)
+                f, cand = int(r[2]), int(r[3])
+                importance[:, f] += r[6 : 6 + E].astype(np.float32)
+                feature.append(f)
+                word.append(cand % Bv | (int(cand >= Bv) << 8))
+                gain.append(r[4])
+                stack.append((d + 1, 2 * j + 1, i))
+                stack.append((d + 1, 2 * j, -1))
             else:
-                leaf_value = float(value[0]) if Kc == 1 else [float(v) for v in value]
-            return {"leaf_value": leaf_value, "samples": int(r[5])}
-
-        return build(0, 0)
+                feature.append(-1 - len(leaves))
+                word.append(int(r[5]))  # a leaf's word holds its training rows
+                gain.append(0.0)
+                leaves.append(r[6 + E :])
+                depth = max(depth, d)
+        self._builder.add_tree(feature, word, gain, np.stack(leaves), cols, learning_rate, depth)
 
     def grow_forest(self):
         """Gradient boosting loop shared by all objectives."""
@@ -1844,19 +1861,13 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         # Warm start: start from where we left off
         start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
 
-        if strategy == PER_OUTPUT:
-            del self.forest[start_iter:]
-        elif len(self.forest) < self.n_estimators:
-            # Ensure forest has enough slots
-            self.forest.extend([{} for _ in range(self.n_estimators - len(self.forest))])
-
         # Software pipeline: round i + 1 is enqueued on the GPU before the host turns round i
         # into tree dicts and evaluates it, so host work overlaps with GPU work. When early
         # stopping ends training at round i, the speculative round i + 1 is dropped; its score
         # update does not matter then (training stops with a rollback to the best round).
         pending = None
         for i in range(start_iter, self.n_estimators):
-            # Finiteness is checked with the tree's host transfer (see _tree_from_records)
+            # Finiteness is checked with the tree's host transfer (see _add_tree_from_records)
             g, h = compute_grad_hess(
                 self.objective_, self.Y_gpu, self.scores, self.tw.weight, self.tw.mask,
                 check_finite=False,
@@ -1930,19 +1941,20 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         # Recorded on the stream of the copy (the model device's, not the caller's current one)
         done = torch.cuda.Event()
         done.record(torch.cuda.current_stream(records.device))
-        return host, done, grad.shape[1], None if cols is None else cols[1]
+        if score_col is not None:
+            tree_cols = [score_col]
+        else:
+            tree_cols = None if cols is None else cols[1]
+        return host, done, grad.shape[1], tree_cols
 
     def _finish_round(self, i, launched, round_scores):
-        """Turn the records of round i into tree dicts, store and evaluate the round."""
-        trees = []
+        """Turn the records of round i into trees, store and evaluate the round."""
+        learning_rate = float(self.learning_rate)
         for host, done, Kc, cols in launched:
             done.synchronize()
-            trees.append(self._tree_from_records(host.numpy(), Kc, cols))
-        if self._output_strategy() == PER_OUTPUT:
-            self.forest.append(trees)
-        else:
-            self.forest[i] = trees[0]
-        self.round_learning_rates_.append(float(self.learning_rate))
+            self._add_tree_from_records(host.numpy(), Kc, cols, learning_rate)
+        self._builder.end_round()
+        self.round_learning_rates_.append(learning_rate)
         self.round_max_depths_.append(int(self.max_depth))
         self._trees_trained = i + 1
         self.compute_eval(i, round_scores)
@@ -2012,16 +2024,17 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
     def _add_round_to_eval_scores(self, i):
         """
-        Add round i to the eval scores. The tree sums are accumulated with the same additions as
-        the prediction kernel, so the eval scores equal predict_raw(X_eval, num_trees=i + 1).
+        Add round i (the newest round of the fit) to the eval scores. The tree sums continue from
+        those of the earlier rounds with the same additions as the prediction kernel, so the eval
+        scores equal predict_raw(X_eval, num_trees=i + 1).
         """
-        self._ensure_packed(i + 1)
-        nodes, leaf, out_col = (self._to_device(a) for a in self._pack_rounds[i])
-        if self._output_strategy() != PER_OUTPUT:
-            out_col = None
-        self._eval_acc = self._forest_kernel(
-            self.bin_indices_eval, nodes, leaf, out_col, self._eval_acc, [nodes.size(0)]
-        )[0]
+        block = self._builder.round_block(-1)
+        acc = torch.empty_like(self._eval_acc)
+        _run_block(
+            self.bin_indices_eval, False, block, block.num_trees, self.num_outputs, self.nan_bin,
+            self._eval_acc, self._eval_zero, [], None, acc, cache=False,
+        )
+        self._eval_acc = acc
         self._eval_scores = self._base_score_tensor() + self._eval_acc
 
     @_on_model_device
@@ -2074,7 +2087,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.best_iteration_ = i + 1
             self._evals_since_best = 0
             self._best_importance = self._feature_importance_acc.copy()
-            if self._rollback:
+            if self._rollback and self._keep_train_predictions:
                 self._best_train_scores = train_scores.clone()
         else:
             self._evals_since_best += 1
@@ -2120,18 +2133,21 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             return _prebinned_to_gpu(X_np, self.num_bins, self.device, name)
         return self.bin_data_with_existing_edges(X_np)
 
-    def _bin_inference_cpu(self, X_np, name="X"):
+    def _bin_inference_cpu(self, X_np, name="X", cache=True):
         """bin_inference_data on the CPU: internal int8 bins [N, F] as a numpy array."""
         self._check_input_shape(X_np, name)
         if self.prebinned_:
             return _prebinned_to_cpu(X_np, self.num_bins, name)
         if self.bin_edges is None:
             raise ValueError("This model has no bin edges (it was fitted on pre-binned data).")
-        if self._edges_cpu is None:
-            self._edges_cpu = self.bin_edges.detach().cpu().numpy().astype(np.float32, copy=False)
+        edges = self._edges_cpu
+        if edges is None:
+            edges = self.bin_edges.detach().cpu().numpy().astype(np.float32, copy=False)
+            if cache:
+                self._edges_cpu = edges
         if torch.is_tensor(X_np):
             X_np = X_np.detach().cpu().numpy()
-        return _bin_matrix_cpu(X_np, self._edges_cpu, self.nan_bin)
+        return _bin_matrix_cpu(X_np, edges, self.nan_bin)
 
     def _base_score_np(self):
         """Initial raw score as a [K] float32 numpy array (cached)."""
@@ -2163,23 +2179,25 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             )
         return True
 
-    def _predict_raw_binned(self, bin_indices, num_trees=None, feature_major=False):
+    def _predict_raw_binned(self, bin_indices, num_trees=None, feature_major=False, cache=True):
         """Raw scores [N, K] for binned data, using the first num_trees rounds (None: default model)."""
         num_trees = self._resolve_num_trees(num_trees)
-        return self._predict_raw_staged_binned(bin_indices, [num_trees], feature_major)[0]
+        return self._predict_raw_staged_binned(
+            bin_indices, [num_trees], feature_major, cache=cache
+        )[0]
 
-    def _staged_raw(self, X_np, rounds, device):
+    def _staged_raw(self, X_np, rounds, device, cache=True):
         """Raw scores [P, N, K] (torch, on the GPU or the CPU) after each of rounds (ascending)."""
         if self._use_cpu(device):
             return torch.from_numpy(
-                self._predict_raw_staged_cpu(self._bin_inference_cpu(X_np), rounds)
+                self._predict_raw_staged_cpu(self._bin_inference_cpu(X_np, cache=cache), rounds)
             )
-        return self._staged_raw_gpu(X_np, rounds)
+        return self._staged_raw_gpu(X_np, rounds, cache)
 
     @_on_model_device
-    def _staged_raw_gpu(self, X_np, rounds):
+    def _staged_raw_gpu(self, X_np, rounds, cache=True):
         bin_indices = self.bin_inference_data(X_np)
-        return self._predict_raw_staged_binned(bin_indices, rounds)
+        return self._predict_raw_staged_binned(bin_indices, rounds, cache=cache)
 
     def _resolve_rounds(self, rounds):
         """Validated round counts and the sorted unique ones: (rounds, unique, positions)."""
@@ -2203,12 +2221,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             raise ValueError("Model has not been fitted yet. Call fit() first.")
 
     @_on_model_device
-    def predict_binned(self, bin_indices, num_trees=None):
+    def predict_binned(self, bin_indices, num_trees=None, cache=True):
         """Transformed predictions for binned data ([N] for single-output targets)."""
-        pred = self.objective_.transform(self._predict_raw_binned(bin_indices, num_trees))
+        pred = self.objective_.transform(self._predict_raw_binned(bin_indices, num_trees, cache=cache))
         return self._output_shape(pred)
 
-    def predict_raw(self, X_np, num_trees=None, device=None):
+    def predict_raw(self, X_np, num_trees=None, device=None, cache=True):
         """
         Raw (untransformed) scores, e.g. logits for classification.
 
@@ -2217,15 +2235,18 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         device: None predicts on the model's GPU; "cpu" uses a NumPy implementation without any
         CUDA call (lowest latency for a few rows). Both give identical raw scores (transforms
         such as softmax may differ in the last bit).
+        cache: keep the device copy of the trees for the next predictions (False: a temporary
+        copy for this call only, e.g. one-shot validation predictions of many models; see
+        release_prediction_cache).
 
         Returns shape (n_samples,) for single-output regression-like models, else (n_samples, K).
         """
         self._check_fitted()
         num_trees = self._resolve_num_trees(num_trees)
-        raw = self._staged_raw(X_np, [num_trees], device)[0]
+        raw = self._staged_raw(X_np, [num_trees], device, cache)[0]
         return self._output_shape(raw).cpu().numpy()
 
-    def predict(self, X_np, num_trees=None, device=None):
+    def predict(self, X_np, num_trees=None, device=None, cache=True):
         """
         Predict on new data.
 
@@ -2234,25 +2255,25 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         num_trees: number of boosting rounds to use. None uses the default model, i.e.
         best_iteration_ after early stopping and all trained rounds otherwise.
-        device: None (model GPU) or "cpu", see predict_raw.
+        device: None (model GPU) or "cpu", cache: see predict_raw.
         """
         self._check_fitted()
         num_trees = self._resolve_num_trees(num_trees)
         if self.objective_.is_classifier:
             # Classification: return class labels
-            probs = self.predict_proba(X_np, num_trees, device=device)
+            probs = self.predict_proba(X_np, num_trees, device=device, cache=cache)
             class_indices = np.argmax(probs, axis=1)
             return self.label_encoder.inverse_transform(class_indices)
 
-        raw = self._staged_raw(X_np, [num_trees], device)[0]
+        raw = self._staged_raw(X_np, [num_trees], device, cache)[0]
         return self._output_shape(self.objective_.transform(raw)).cpu().numpy()
 
-    def predict_proba(self, X_np, num_trees=None, device=None):
+    def predict_proba(self, X_np, num_trees=None, device=None, cache=True):
         """
         Predict class probabilities (classification only).
 
         num_trees: number of boosting rounds to use (None: default model, see predict).
-        device: None (model GPU) or "cpu", see predict_raw.
+        device: None (model GPU) or "cpu", cache: see predict_raw.
 
         Returns:
             np.array of shape (n_samples, n_classes) with probabilities
@@ -2261,25 +2282,25 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             raise ValueError("predict_proba only available for classification objectives")
         self._check_fitted()
         num_trees = self._resolve_num_trees(num_trees)
-        raw = self._staged_raw(X_np, [num_trees], device)[0]
+        raw = self._staged_raw(X_np, [num_trees], device, cache)[0]
         return self.objective_.transform(raw).cpu().numpy()
 
     @_on_model_device
-    def predict_proba_binned(self, bin_indices, num_trees=None):
+    def predict_proba_binned(self, bin_indices, num_trees=None, cache=True):
         """
         Predict probabilities from pre-binned data (classification).
 
         Returns:
             torch.Tensor of shape (n_samples, n_classes) with probabilities
         """
-        return self.objective_.transform(self._predict_raw_binned(bin_indices, num_trees))
+        return self.objective_.transform(self._predict_raw_binned(bin_indices, num_trees, cache=cache))
 
-    def staged_predict_raw(self, X_np, rounds, device=None):
+    def staged_predict_raw(self, X_np, rounds, device=None, cache=True):
         """
         Raw scores after several numbers of boosting rounds, from one pass over the forest.
 
         rounds: sequence of round counts (0 … num_trees_), any order, duplicates allowed.
-        device: None (model GPU) or "cpu", see predict_raw.
+        device: None (model GPU) or "cpu", cache: see predict_raw.
 
         Returns an array of shape (len(rounds), n_samples) for single-output regression-like
         models, else (len(rounds), n_samples, K); entry p equals
@@ -2287,10 +2308,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         """
         self._check_fitted()
         unique, positions = self._resolve_rounds(rounds)
-        raw = self._staged_raw(X_np, unique, device)[positions]
+        raw = self._staged_raw(X_np, unique, device, cache)[positions]
         return self._output_shape(raw).cpu().numpy()
 
-    def staged_predict(self, X_np, rounds, device=None):
+    def staged_predict(self, X_np, rounds, device=None, cache=True):
         """
         predict() after several numbers of boosting rounds, from one pass over the forest.
 
@@ -2299,42 +2320,33 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         """
         self._check_fitted()
         unique, positions = self._resolve_rounds(rounds)
-        raw = self._staged_raw(X_np, unique, device)
+        raw = self._staged_raw(X_np, unique, device, cache)
         pred = torch.stack([self.objective_.transform(r) for r in raw])[positions]
         if self.objective_.is_classifier:
             labels = torch.argmax(pred, dim=2).cpu().numpy()
             return np.stack([self.label_encoder.inverse_transform(l) for l in labels])
         return self._output_shape(pred).cpu().numpy()
 
-    def staged_predict_proba(self, X_np, rounds, device=None):
+    def staged_predict_proba(self, X_np, rounds, device=None, cache=True):
         """predict_proba() after several numbers of boosting rounds: (len(rounds), n_samples, K)."""
         if not self._is_classifier():
             raise ValueError("staged_predict_proba only available for classification objectives")
         self._check_fitted()
         unique, positions = self._resolve_rounds(rounds)
-        raw = self._staged_raw(X_np, unique, device)
+        raw = self._staged_raw(X_np, unique, device, cache)
         return torch.stack([self.objective_.transform(r) for r in raw])[positions].cpu().numpy()
 
     # ─── Feature importance ───
 
-    def _split_nodes(self, num_trees):
-        """Yield every split node of the first num_trees rounds."""
-        for round_trees in self.forest[:num_trees]:
-            trees = round_trees if isinstance(round_trees, list) else [round_trees]
-            for tree in trees:
-                stack = [tree] if tree else []
-                while stack:
-                    node = stack.pop()
-                    if "leaf_value" in node:
-                        continue
-                    yield node
-                    stack.extend((node["left"], node["right"]))
-
     def _total_importance(self, n):
         """Summed (over eras) gain per feature of the first n rounds, unnormalized."""
         totals = np.zeros(self.num_features, dtype=np.float64)
-        for node in self._split_nodes(n):
-            if "gain" not in node:
+        for block, n_trees in self._block_segments(n):
+            end = int(block.node_start[n_trees])
+            feature = block.feature[:end]
+            split = feature >= 0
+            gains = block.gain[:end][split]
+            if np.isnan(gains).any():
                 # Trees saved before split gains were stored: only the snapshots are known
                 era_importance = self._snapshot_importance(n)
                 if era_importance is None:
@@ -2343,7 +2355,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                         "only available for all trained rounds."
                     )
                 return era_importance.sum(axis=0)
-            totals[node["feature"]] += node["gain"]
+            totals += np.bincount(
+                feature[split], weights=gains.astype(np.float64), minlength=self.num_features
+            )
         return totals.astype(np.float32)
 
     def _snapshot_importance(self, n):
@@ -2475,11 +2489,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             era_importance = self._total_importance(n)[None, :]
         self._per_era_importance_all = era_importance
 
-        if self._output_strategy() == PER_OUTPUT:
-            del self.forest[n:]
-        else:
-            for r in range(n, len(self.forest)):
-                self.forest[r] = {}
+        self._blocks = blocks_prefix(self._forest_blocks(), n)
+        self._merge_tail = None
         self._trees_trained = n
         del self.round_learning_rates_[n:]
         del self.round_max_depths_[n:]
@@ -2491,19 +2502,21 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         if n != default_before:
             self.train_predictions_ = None
 
-        self._invalidate_prediction_cache(keep_rounds=n)
         self.feature_importance_ = self._total_importance(n)
         self.per_era_feature_importance_ = era_importance
         return self
 
     # Fields slice_rounds() does not copy from the source model (set explicitly or left empty)
     _SLICE_SKIP = (
-        "forest", "base_prediction", "round_learning_rates_", "round_max_depths_",
+        "_blocks", "base_prediction", "round_learning_rates_", "round_max_depths_",
         "train_predictions_", "training_loss", "evals_result_", "eval_loss", "eval_iterations_",
         "feature_importance_", "per_era_feature_importance_", "_per_era_importance_all",
-        "_per_era_importance_best", "_pack_rounds", "_pack_concat", "_pack_device", "_pack_key",
-        "_edges_cpu", "_base_cpu", "_base_gpu", "_flat_cpu", "_tree_graphs", "era_indices",
+        "_per_era_importance_best", "era_indices",
     )
+    # Caches and per-fit state that copies and pickles never carry
+    _TRANSIENT = ("_edges_cpu", "_base_cpu", "_base_gpu", "_tree_graphs", "_merge_tail", "_builder")
+    # Prediction caches of v2.8 and older (dropped when such a pickle is loaded)
+    _LEGACY_CACHES = ("_pack_rounds", "_pack_concat", "_pack_device", "_pack_key", "_flat_cpu")
 
     def slice_rounds(self, start, stop=None):
         """
@@ -2514,9 +2527,11 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 == model.predict_raw(X)   (float tolerance)
 
         stop: None uses the default model (best_iteration_ after early stopping, else all trained
-        rounds). Only the rounds of the slice are copied (memory and prediction time are
-        proportional to stop - start); bin edges, objective and per-round learning rates / depths
-        are kept. The slice cannot continue training (warm_start=True raises); its feature
+        rounds). The slice holds only its rounds (memory and prediction time are proportional to
+        stop - start): blocks of rounds that lie inside the slice are shared with this model (e.g.
+        the own rounds of a fork are a block of their own), the rest is copied; bin edges are
+        shared, objective and per-round learning rates / depths are kept. The slice cannot
+        continue training (warm_start=True raises); its feature
         importance covers its own rounds, per-era importance and eval histories are dropped.
         Classifier slices are meant for predict_raw (labels / probabilities of a partial sum of
         rounds have no meaning on their own).
@@ -2536,12 +2551,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._ensure_round_meta()
         n = stop - start
 
-        state = {k: v for k, v in self.__dict__.items() if k not in self._SLICE_SKIP}
-        part = self.__class__.__new__(self.__class__)
-        # One deepcopy call: objects shared by several fields (objective / _objective_source)
-        # stay shared in the copy
-        part.__dict__.update(copy.deepcopy(state))
-        part.forest = copy.deepcopy(self.forest[start:stop])
+        part = self._shared_copy(skip=self._SLICE_SKIP)
+        part._blocks = blocks_range(self._forest_blocks(), start, stop)
         part.round_learning_rates_ = list(self.round_learning_rates_[start:stop])
         part.round_max_depths_ = list(self.round_max_depths_[start:stop])
         part._trees_trained = n
@@ -2553,8 +2564,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         part._reset_eval_state()
         part._per_era_importance_all = None
         part._per_era_importance_best = None
-        part._tree_graphs = {}
-        part._invalidate_prediction_cache()
         zero = torch.zeros(self.num_outputs, dtype=torch.float32, device=self.device)
         part._store_base_score(zero)
         try:
@@ -2564,6 +2573,110 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             part.feature_importance_ = None
         part.per_era_feature_importance_ = None
         return part
+
+    # ─── Copies, forks, pickling ───
+
+    def _shared_copy(self, memo=None, skip=()):
+        """
+        Deep copy of the model state (without the fields in skip) that shares the immutable
+        parts: the blocks of trees (Block.__deepcopy__ returns the block) and the bin edges.
+        Caches are not copied.
+        """
+        memo = {} if memo is None else memo
+        if torch.is_tensor(self.bin_edges):
+            memo[id(self.bin_edges)] = self.bin_edges
+        state = {k: v for k, v in self.__getstate__().items() if k not in skip}
+        new = self.__class__.__new__(self.__class__)
+        # One deepcopy call: objects shared by several fields (objective / _objective_source)
+        # stay shared in the copy
+        new.__dict__.update(copy.deepcopy(state, memo))
+        return new
+
+    def __deepcopy__(self, memo):
+        # Cheap: the trees and the bin edges are shared, caches are not copied (see _shared_copy)
+        return self._shared_copy(memo)
+
+    def __getstate__(self):
+        self._forest_blocks()  # rounds of an interrupted fit become a block
+        # A copy: on Python >= 3.11 the default state is the instance __dict__ itself
+        state = dict(super().__getstate__())
+        for name in self._TRANSIENT:
+            state.pop(name, None)
+        return state
+
+    def __setstate__(self, state):
+        state = dict(state)
+        legacy_forest = state.pop("forest", None)
+        for name in self._TRANSIENT + self._LEGACY_CACHES:
+            state.pop(name, None)
+        super().__setstate__(state)
+        if legacy_forest is not None and "_blocks" not in state:
+            # Pickled by v2.8 or older: trees as dicts
+            self._blocks = ()
+            if self._is_fitted:
+                self._set_dict_forest(legacy_forest)
+        if self._is_fitted:
+            self._ensure_round_meta()
+
+    def fork(self, n_new=None, **params):
+        """
+        A copy of this fitted model ready to continue training (warm_start=True), sharing its
+        trees: only the rounds the copy grows are new memory, and the copy's own rounds become a
+        block of their own (so copy.slice_rounds(model.num_trees_) shares them too). The model
+        itself is unchanged.
+
+        n_new: number of new rounds (sets n_estimators = num_trees_ + n_new); None keeps
+        n_estimators (the total number of rounds, as for any warm start).
+        params: hyperparameters of the new rounds (validated like set_params), e.g.
+        learning_rate, max_depth, min_child_weight, colsample_bytree.
+        """
+        self._check_fitted()
+        if self._is_slice:
+            raise ValueError(
+                "A model from slice_rounds() has no base score and cannot continue training; "
+                "fork the model it was sliced from instead."
+            )
+        if n_new is not None and (
+            isinstance(n_new, bool) or not isinstance(n_new, (int, np.integer)) or n_new < 0
+        ):
+            raise ValueError(f"n_new must be a non-negative integer or None, got {n_new!r}.")
+        child = self._shared_copy(skip=("train_predictions_",))
+        child.train_predictions_ = None
+        if params:
+            child.set_params(**params)
+        child.warm_start = True
+        if n_new is not None:
+            child.n_estimators = self._trees_trained + int(n_new)
+        return child
+
+    def memory_report(self):
+        """
+        Bytes held by the model: forest_bytes (host arrays of the trees), device_cache_bytes
+        (device copies of the trees and the base score), cpu_cache_bytes (CPU bin edges and
+        base score), train_predictions_bytes, bin_edges_bytes and other_device_bytes (other
+        tensors on a GPU). Blocks shared with other models (copies, forks, slices) are counted
+        in full for every model holding them.
+        """
+        blocks = self._forest_blocks()
+
+        def nbytes(value):
+            if torch.is_tensor(value):
+                return value.untyped_storage().nbytes()
+            return value.nbytes if isinstance(value, np.ndarray) else 0
+
+        counted = {"_base_gpu", "_base_cpu", "_edges_cpu", "train_predictions_", "bin_edges"}
+        other = sum(
+            nbytes(v) for k, v in self.__dict__.items()
+            if k not in counted and torch.is_tensor(v) and v.is_cuda
+        )
+        return {
+            "forest_bytes": sum(b.nbytes for b in blocks),
+            "device_cache_bytes": sum(b.device_nbytes() for b in blocks) + nbytes(self._base_gpu),
+            "cpu_cache_bytes": nbytes(self._edges_cpu) + nbytes(self._base_cpu),
+            "train_predictions_bytes": nbytes(self.train_predictions_),
+            "bin_edges_bytes": nbytes(self.bin_edges),
+            "other_device_bytes": other,
+        }
 
     # ─── Persistence ───
 
@@ -2615,7 +2728,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             "deterministic": self.deterministic,
             # Trained state
             "objective_": self.objective_,
-            "forest": self.forest,
+            "forest_blocks": list(self._forest_blocks()),
             "bin_edges": to_cpu(self.bin_edges),
             "prebinned_": self.prebinned_,
             "base_prediction": to_cpu(self.base_prediction),
@@ -2703,7 +2816,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         # Restore trained state
         self.objective_ = state.get("objective_") or resolve_objective(self.objective)
-        self.forest = state['forest']
         bin_edges = state['bin_edges']
         self.bin_edges = bin_edges.to(self.device) if torch.is_tensor(bin_edges) else bin_edges
         # Models saved before prebinned_ was stored keep binning with their (identity) edges
@@ -2735,6 +2847,13 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.round_learning_rates_ = state.get("round_learning_rates_")
         self.round_max_depths_ = state.get("round_max_depths_")
         self._is_slice = state.get("_is_slice", False)
+        self._builder = None
+        self._merge_tail = None
+        if "forest_blocks" in state:
+            self._blocks = tuple(state["forest_blocks"])
+        else:
+            # Saved by v2.8 or older: trees as dicts
+            self._set_dict_forest(state["forest"])
         self._objective_source = self.objective
         self.training_loss = state.get('training_loss', [])
         # Models saved before best-iteration tracking: all trees, no best round
@@ -2767,7 +2886,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         )
 
         self.monotonic_required_split_direction_gpu_ = None
-        self._invalidate_prediction_cache()
+        self._base_cpu = self._base_gpu = self._edges_cpu = None
         self._ensure_round_meta()
 
         if self.verbose:
@@ -2823,3 +2942,112 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 flat[i, 6] = node["nan_left"]
 
         return flat
+
+
+def predict_many(models, X, num_trees=None, device=None, raw=False, cache=True):
+    """
+    Predictions of several fitted models on the same rows, as one array [M, N, K] ([M, N] when
+    every model is a single-output regression-like model). Entry m equals
+    models[m].predict_raw(X, num_trees) with raw=True, else the objective's transform of it (the
+    predictions of regression models, class probabilities of classifiers), bit for bit.
+
+    The input is binned once per binning (one for all pre-binned models, one per distinct
+    bin_edges tensor of models fitted on raw features), and blocks of trees that several models
+    share (e.g. the parent rounds of forks / copies of one model) are evaluated once: the tree
+    sums after a shared block are carried on to every model that continues from it.
+
+    num_trees: None (each model's default rounds), an int for all models, or one per model.
+    device: None (the models' GPU, the same for all) or "cpu" (NumPy, no CUDA call).
+    cache: keep the device copies of the trees (see WarpGBM.predict_raw).
+    """
+    models = list(models)
+    if not models:
+        raise ValueError("predict_many needs at least one model.")
+    for m in models:
+        if not isinstance(m, WarpGBM):
+            raise TypeError(f"predict_many takes WarpGBM models, got {type(m).__name__}.")
+        m._check_fitted()
+    first = models[0]
+    for m in models[1:]:
+        if (m.num_features, m.num_outputs, m.num_bins) != (first.num_features, first.num_outputs, first.num_bins):
+            raise ValueError(
+                "predict_many needs models with the same number of features, outputs and bins."
+            )
+    if num_trees is None or isinstance(num_trees, (int, np.integer)):
+        num_trees = [num_trees] * len(models)
+    elif len(num_trees) != len(models):
+        raise ValueError("num_trees must be None, an int, or one value per model.")
+    rounds = [m._resolve_num_trees(n) for m, n in zip(models, num_trees)]
+    K = first.num_outputs
+    use_cpu = WarpGBM._use_cpu(device)
+    if not use_cpu:
+        dev = torch.device(first.device)
+        if any(torch.device(m.device) != dev for m in models):
+            raise ValueError("predict_many on the GPU needs models on the same device.")
+
+    def bin_key(m):
+        return ("prebinned",) if m.prebinned_ else ("edges", id(m.bin_edges))
+
+    groups = {}
+    for i, m in enumerate(models):
+        groups.setdefault(bin_key(m), []).append(i)
+
+    if use_cpu:
+        out = np.empty((len(models), X.shape[0], K), dtype=np.float32)
+        for idx in groups.values():
+            bins = models[idx[0]]._bin_inference_cpu(X, cache=cache)
+
+            def emit(i, rows, sums):
+                out[i, rows] = models[i]._base_score_np() + sums
+
+            # One vectorized walk of all trees of all models (see forest.trie_sums_cpu)
+            trie_sums_cpu(_prefix_trie(models, rounds, idx), bins, first.nan_bin, K, emit)
+        raw_out = torch.from_numpy(out)
+    else:
+        with torch.cuda.device(dev), torch.no_grad():
+            out = None
+            for idx in groups.values():
+                bins = models[idx[0]].bin_inference_data(X)
+                if out is None:
+                    out = torch.empty((len(models), bins.size(0), K), dtype=torch.float32, device=dev)
+                zero = torch.zeros(K, dtype=torch.float32, device=dev)
+
+                def visit(node, acc):
+                    for i in node["models"]:
+                        m = models[i]
+                        base = m._base_score_tensor() if cache else m._to_device(m._base_score_np())
+                        out[i] = base + (acc if acc is not None else torch.zeros_like(out[i]))
+                    for child in node["children"].values():
+                        sums = torch.empty((bins.size(0), K), dtype=torch.float32, device=dev)
+                        _run_block(
+                            bins, False, child["block"], child["n_trees"], K, first.nan_bin, acc,
+                            zero, [], None, sums, cache,
+                        )
+                        visit(child, sums)
+
+                visit(_prefix_trie(models, rounds, idx), None)
+            raw_out = out
+    if not raw:
+        raw_out = torch.stack([models[i].objective_.transform(raw_out[i]) for i in range(len(models))])
+    result = raw_out.cpu().numpy()
+    if K == 1 and all(not m.objective_.is_classifier and m._targets_1d for m in models):
+        result = result[..., 0]
+    return result
+
+
+def _prefix_trie(models, rounds, idx):
+    """
+    Trie of the block sequences of the models idx (their first rounds[i] rounds): a node
+    {"block", "n_trees", "children", "models"} per (block, trees used) that a group of models
+    shares as a common prefix; "models" lists the models whose trees end at the node.
+    """
+    root = {"children": {}, "models": []}
+    for i in idx:
+        node = root
+        for block, n_trees in models[i]._block_segments(rounds[i]):
+            key = (id(block), n_trees)
+            node = node["children"].setdefault(
+                key, {"block": block, "n_trees": n_trees, "children": {}, "models": []}
+            )
+        node["models"].append(i)
+    return root

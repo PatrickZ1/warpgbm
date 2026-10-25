@@ -157,14 +157,16 @@ def test_two_learning_rates_equal_parts(fitted):
 
     np.testing.assert_array_equal(m.predict_raw(X, num_trees=n1), p1)
     assert m.round_learning_rates_ == [0.2] * n1 + [0.05] * n2
-    # Packed leaves are the tree leaves times their round's rate
-    nodes, leaf, _, round_end = m._packed_forest(n1 + n2)
+    # Stored trees keep their leaves unscaled and the learning rate of their round (the
+    # predictors multiply in float32, as the packed leaves of v2.8 were)
+    (block,) = m._forest_blocks()
+    np.testing.assert_array_equal(block.lr, np.float32(m.round_learning_rates_))
     for r in (0, n1 - 1, n1, n1 + n2 - 1):
-        t = int(round_end[r]) - 1
-        values = np.asarray(_leaf_values(m.forest[r]), dtype=np.float32)
-        used = 2 * len(values) - 1  # nodes of the tree, in pre-order
-        packed = leaf[t][:used][nodes[t][:used, 0] < 0]
-        np.testing.assert_array_equal(packed, values * np.float32(m.round_learning_rates_[r]))
+        values = np.asarray(_leaf_values(m.forest[r]), dtype=np.float32).reshape(-1, K)
+        cols = block.tree_columns(r)
+        stored = block.values[block.value_start[r] : block.value_start[r + 1]].reshape(-1, len(cols))
+        np.testing.assert_array_equal(stored, values[:, cols])
+        assert not values[:, np.setdiff1d(np.arange(K), cols)].any()
     # The second part as a slice
     part = m.slice_rounds(n1)
     np.testing.assert_allclose(part.predict_raw(X), m.predict_raw(X) - p1, rtol=0, atol=1e-5)
@@ -317,22 +319,33 @@ def test_load_v27_model_and_pickle(fitted, tmp_path):
         state = pickle.load(f)
     for key in ("round_learning_rates_", "round_max_depths_", "_is_slice"):
         del state[key]
+    # v2.7 stored the trees as dicts (padded with empty slots up to n_estimators)
+    n = model.num_trees_
+    state["forest"] = list(model.forest) + [{}] * 3
+    del state["forest_blocks"]
     with open(path, "wb") as f:
         pickle.dump(state, f)
     loaded = WarpGBM(verbose=False).load_model(str(path))
-    n = model.num_trees_
     assert loaded.round_learning_rates_ == [model.learning_rate] * n
     # Depths come from the stored trees
     assert loaded.round_max_depths_ == [model._tree_depth(t) for t in model.forest[:n]]
     np.testing.assert_array_equal(loaded.predict(X), model.predict(X))
+    assert loaded.forest == model.forest
 
-    # An instance pickled by v2.7 (attributes missing, class defaults None)
-    old = copy.deepcopy(model)
-    del old.__dict__["round_learning_rates_"], old.__dict__["round_max_depths_"]
-    old._invalidate_prediction_cache()
+    # An instance pickled by v2.7: trees as dicts, round attributes missing (class defaults
+    # None), packed prediction caches in the state
+    old_state = model.__getstate__()
+    del old_state["_blocks"], old_state["round_learning_rates_"], old_state["round_max_depths_"]
+    old_state["forest"] = list(model.forest)
+    old_state["_pack_rounds"] = [("stale", "cache")]
+    old_state["_flat_cpu"] = ("stale",)
+    old = WarpGBM.__new__(WarpGBM)
+    old.__setstate__(old_state)
     old = pickle.loads(pickle.dumps(old))
     np.testing.assert_array_equal(old.predict(X), model.predict(X))
-    assert len(old.round_learning_rates_) == n
+    np.testing.assert_array_equal(old.predict(X, device="cpu"), model.predict(X))
+    assert old.round_learning_rates_ == [model.learning_rate] * n
+    assert "_pack_rounds" not in old.__dict__ and "_flat_cpu" not in old.__dict__
 
 
 def test_truncate_then_new_learning_rate(fitted):

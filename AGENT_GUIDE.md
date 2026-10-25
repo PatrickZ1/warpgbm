@@ -112,7 +112,7 @@ warpgbm/
 │   ├── _level_splits()      # histograms of a level (subtraction or memory-bounded chunks) + split kernels
 │   ├── _tree_from_records() # host: tree dict + feature importance from the per-tree record tensor
 │   ├── compute_eval()       # incremental eval scores, built-in / callable metrics, early stopping
-│   ├── _packed_forest()     # flattened forest cache (per round, all outputs) for the predict kernel
+│   ├── _forest_blocks()     # immutable compact blocks of rounds (warpgbm/forest.py), read by both predictors
 │   ├── predict(), predict_raw(), predict_proba(), staged_predict*()  # device=None (GPU) or "cpu"
 │   └── save_model() / load_model()
 │
@@ -204,6 +204,8 @@ Trees are stored as nested Python dictionaries:
     'samples': 150          # Number of samples in leaf
 }
 ```
+
+`model.forest` is a read-only view: the dicts are built on access from the compact blocks (v2.9).
 
 **per_output strategy (multiclass/binary)**: `forest[round]` is a list of K trees (one per class).
 
@@ -655,12 +657,15 @@ X, y = make_blobs(n_samples=1000, centers=5, random_state=42)
 - Gain summed over outputs; direction only if all outputs agree; `min_child_weight` on the count channel, `min_sum_hessian` per output
 
 **4. Prediction** (`predict.cu`):
-- Input: bins with explicit strides (row- or feature-major), packed forest `nodes [T, M, 4]`
-  (feature or −1, split bin | nan_left << 8, left, right), `leaf [T, M, Lw]` (× learning rate),
-  `out_col` for per-output trees, base score `[K]` or `[N, K]`, checkpoint tree counts
-- Output: `[checkpoints, N, K]`; one thread per row, all trees and outputs, in-order plain additions
-  (deterministic, bit-identical to the NumPy path `_predict_raw_staged_cpu`)
-- The packed forest is built once per round (`_pack_round`) and cached (`_packed_forest`)
+- Input: bins with explicit strides (row- or feature-major) and one forest block
+  (`warpgbm/forest.py`): pre-order nodes `[n, 2]` (feature or −1 − leaf index; bin | nan_left << 8
+  | right offset << 9), unscaled leaf values per tree column, per-tree meta (first node, first
+  value, column mask, n_cols) and learning rate, carried sums `init`, base score, checkpoints
+- Output: `[checkpoints, N, K]` and the sums after the block (`acc_out`, carried to the next block);
+  one thread per row, trees in order, `acc + leaf × lr` without FMA (identical to the NumPy path
+  `Block.scores_cpu` / `trie_sums_cpu`)
+- Blocks are immutable and shared by copies / forks / slices; their device copy is cached on the
+  block (`release_prediction_cache` drops it)
 
 ### Memory Management
 
