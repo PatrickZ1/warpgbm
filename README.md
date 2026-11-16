@@ -42,14 +42,11 @@ Drop-in replacement. Same API you know, 10x the speed you need.
 ### Installation
 
 ```bash
-# Latest from GitHub (recommended)
-pip install git+https://github.com/jefferythewind/warpgbm.git
-
-# Stable from PyPI
-pip install warpgbm
+# Install a CUDA-enabled PyTorch first, then:
+pip install --no-build-isolation git+https://github.com/PatrickZ1/warpgbm.git
 ```
 
-**Prerequisites:** PyTorch with CUDA support ([install guide](https://pytorch.org/get-started/locally/))
+**Prerequisites:** a CUDA-enabled PyTorch ([install guide](https://pytorch.org/get-started/locally/)) and a CUDA toolkit (`nvcc`) whose **major version matches `torch.version.cuda`** (e.g. a `cu128` PyTorch needs a CUDA 12.x toolkit). See [Installation Details](#-installation-details).
 
 ### Regression in 5 Lines
 
@@ -644,24 +641,40 @@ model.bin_edges                   # Bin edges [n_features, num_bins - 1] (None f
 
 ## 🔧 Installation Details
 
-### Linux / macOS (Recommended)
+### Linux (Recommended)
 
 ```bash
-pip install git+https://github.com/jefferythewind/warpgbm.git
+pip install --no-build-isolation git+https://github.com/PatrickZ1/warpgbm.git
 ```
 
-Compiles CUDA extensions using your local PyTorch + CUDA setup.
+The CUDA kernels are compiled at install time against the PyTorch already in your environment.
+`--no-build-isolation` makes pip use that PyTorch; without it, pip downloads the newest PyPI
+PyTorch into a temporary build environment, and the compiled extension may not match the
+PyTorch you actually run.
 
-### Colab / Mismatched CUDA Versions
+### CUDA version requirements
+
+The build needs a CUDA toolkit (`nvcc`) with the **same major version** as the CUDA your PyTorch
+was built for. Check both with:
 
 ```bash
-pip install warpgbm --no-build-isolation
+nvcc --version   # or $CUDA_HOME/bin/nvcc --version
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
 ```
+
+PyTorch finds the toolkit through `$CUDA_HOME`, then `$CUDA_PATH`, then the `nvcc` on your
+`PATH`, then `/usr/local/cuda`. If the versions don't match, setup stops with
+`CUDA major version mismatch`. To fix it, either:
+
+- install the PyTorch build for your toolkit, e.g. `pip install torch --index-url https://download.pytorch.org/whl/cu118`, or
+- install a toolkit matching your PyTorch and point to it, e.g. `export CUDA_HOME=/usr/local/cuda-12.8`
+
+and then reinstall WarpGBM. A CPU-only PyTorch can't build WarpGBM; setup stops with an error.
 
 ### Windows
 
 ```bash
-git clone https://github.com/jefferythewind/warpgbm.git
+git clone https://github.com/PatrickZ1/warpgbm.git
 cd warpgbm
 python setup.py bdist_wheel
 pip install dist/warpgbm-*.whl
